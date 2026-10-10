@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+psycopg[binary,pool]
+httpx
+anthropic>=1.12
+neatlogs>=1.4.25
+pyyaml
+cryptography
+opentelemetry-proto>=1.27
+cramjam>=2.8
+boto3>=1.34

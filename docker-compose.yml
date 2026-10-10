@@ -1,0 +1,87 @@
+name: tracewise
+
+x-backend: &backend
+  build: ./backend
+  env_file: .env
+  user: "${UID:-1000}:${GID:-1000}"
+  environment:
+    DATABASE_URL: postgresql://tracewise:tracewise@postgres:5432/tracewise
+    DEPLOYER_URL: http://shopfront:7000
+    SHOPFRONT_REPO: /repos/shopfront
+  volumes:
+    - ./demo/shopfront:/repos/shopfront
+    - ./backend/tracewise:/app/tracewise:ro
+  depends_on:
+    postgres:
+      condition: service_healthy
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: tracewise
+      POSTGRES_PASSWORD: tracewise
+      POSTGRES_DB: tracewise
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "19110:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tracewise"]
+      interval: 3s
+      retries: 20
+    restart: unless-stopped
+
+  api:
+    <<: *backend
+    command: uvicorn tracewise.api:app --host 0.0.0.0 --port 8000 --no-access-log
+    ports:
+      - "19100:8000"
+    volumes:
+      - ./demo/shopfront:/repos/shopfront
+      - ./backend/tracewise:/app/tracewise:ro
+      - ./cli:/app/cli:ro
+
+  collector:
+    <<: *backend
+    command: python -m tracewise.collector
+    ports:
+      - "19114:5514/udp"
+      - "19114:5514/tcp"
+
+  worker:
+    <<: *backend
+    command: python -m tracewise.worker
+
+  runner:
+    <<: *backend
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.runner
+    command: python -m tracewise.runner
+    volumes:
+      - ./demo/shopfront:/repos/shopfront
+      - ./backend/tracewise:/app/tracewise:ro
+      - ./.runner-work:/work
+
+  shopfront:
+    build:
+      context: ./demo
+      dockerfile: runtime/Dockerfile
+    user: "${UID:-1000}:${GID:-1000}"
+    environment:
+      SHOPFRONT_REPO: /repos/shopfront
+      TW_INGEST_URL: http://api:8000
+      TW_INGEST_KEY: ${TW_INGEST_KEY:-}
+    volumes:
+      - ./demo/shopfront:/repos/shopfront
+    ports:
+      - "19101:7101"   # storefront gateway
+      - "19102:7000"   # deployer
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  pgdata:
