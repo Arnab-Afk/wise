@@ -1,0 +1,1184 @@
+#!/usr/bin/env python3
+"""Tracewise host agent: ships logs, crashes, restarts and deploys from wherever apps run.
+
+    tracewise login --url https://tracewise.example.com --key <ingest key>
+    tracewise detect                 # what can be watched on this machine
+    tracewise init                   # write tracewise.json from what was found
+    tracewise run                    # watch everything in tracewise.json
+    tracewise watch pm2 | systemd --unit nginx | docker | kubernetes | file PATH --service NAME
+                    | syslog | http URL --service NAME | supervisor | macos
+    tracewise exec --service worker -- python worker.py   # wrap any process
+    tracewise deploy --service checkout [--sha SHA]        # record a deploy from CI
+
+Only needs Python 3.8+ and the standard library. Stack traces spread over several lines are
+joined back into one event. Identical lines within a flush are collapsed into one with a count.
+"""
+
+import argparse
+import glob
+import gzip
+import json
+import os
+import platform
+import queue
+import re
+import shutil
+import signal
+import socket
+import socketserver
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+
+VERSION = "0.1.0"
+HOST = socket.gethostname()
+CONFIG_PATH = os.environ.get("TRACEWISE_CONFIG") or os.path.expanduser("~/.config/tracewise/config.json")
+LEVELS = ["debug", "info", "warning", "error", "critical"]
+STOP = threading.Event()
+
+
+def log(msg):
+    print(f"[tracewise] {msg}", file=sys.stderr, flush=True)
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+# ====================================================================== levels & traces
+
+_GUESS = [
+    (re.compile(r"\b(FATAL|PANIC|CRITICAL|EMERG(?:ENCY)?)\b|^panic: |\[(crit|alert|emerg)\]"), "critical"),
+    (re.compile(r"\b(ERROR|ERR|SEVERE)\b|Traceback \(most recent call last\)|\b(Uncaught|Unhandled)\b|"
+                r"\b(?:[A-Z]\w*)?(Error|Exception)\b:|\[error\]|(?i:\blevel[=:]\s*\"?(error|err|fatal|critical)\b)"), "error"),
+    (re.compile(r"\bWARN(ING)?\b|\[warn\]|(?i:\blevel[=:]\s*\"?warn)"), "warning"),
+    (re.compile(r"\bDEBUG\b|\bTRACE\b"), "debug"),
+]
+_NAMES = {"trace": "debug", "debug": "debug", "verbose": "debug", "info": "info", "notice": "info",
+          "information": "info", "warn": "warning", "warning": "warning", "error": "error", "err": "error",
+          "severe": "error", "critical": "critical", "crit": "critical", "fatal": "critical",
+          "panic": "critical", "emerg": "critical", "alert": "critical"}
+_PINO = {10: "debug", 20: "debug", 30: "info", 40: "warning", 50: "error", 60: "critical"}
+
+
+def guess_level(text):
+    head = (text or "")[:400]
+    for pattern, level in _GUESS:
+        if pattern.search(head):
+            return level
+    return "error" if "Traceback (most recent call last)" in (text or "") else "info"
+
+
+def level_of(value, text=""):
+    if value is None or value == "":
+        return guess_level(text)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        n = int(value)
+        if n in _PINO:
+            return _PINO[n]
+        if 0 <= n <= 7:
+            return ["critical", "critical", "critical", "error", "warning", "info", "info", "debug"][n]
+        return guess_level(text)
+    return _NAMES.get(str(value).strip().lower(), guess_level(text))
+
+
+def rank(level):
+    return LEVELS.index(level) if level in LEVELS else 1
+
+
+_CONTINUATION = re.compile(
+    r"^(\s+\S|\s*at [\w$.<>\[\]/:@-]+|Caused by:|\s*\.\.\. \d+ more|During handling of the above|"
+    r"The above exception was the direct cause|goroutine \d+ \[|\t)")
+_PY_EXC_TAIL = re.compile(r"^[\w.]+(Error|Exception|Exit|Interrupt|Warning)\b.*|^[\w.]+: ")
+
+
+class Assembler:
+    """Joins multi-line stack traces (Python, Java, Node, Go, .NET) back into one record."""
+
+    def __init__(self, emit, max_lines=200):
+        self.emit, self.max_lines = emit, max_lines
+        self.pending, self.lines, self.last = None, [], 0.0
+        self.lock = threading.Lock()
+
+    def feed(self, line, meta):
+        line = line.rstrip("\r\n")
+        with self.lock:
+            if self.pending is not None and self._continues(line):
+                self.lines.append(line)
+                self.last = time.time()
+                if len(self.lines) >= self.max_lines:
+                    self._flush()
+                return
+            self._flush()
+            self.pending, self.lines, self.last = meta, [line], time.time()
+            if not line.startswith("Traceback") and not line.rstrip().endswith(":"):
+                pass  # it may still gain "    at ..." lines; wait for the tick
+
+    def _continues(self, line):
+        if not line.strip():
+            return False
+        if _CONTINUATION.match(line):
+            return True
+        # Python's final "ValueError: ..." line after an indented traceback
+        return (self.lines[0].startswith("Traceback") and self.lines[-1].startswith((" ", "\t"))
+                and bool(_PY_EXC_TAIL.match(line)))
+
+    def tick(self, idle=0.3):
+        with self.lock:
+            if self.pending is not None and time.time() - self.last >= idle:
+                self._flush()
+
+    def _flush(self):
+        if self.pending is None:
+            return
+        text = "\n".join(self.lines)
+        meta, self.pending, self.lines = self.pending, None, []
+        if text.strip():
+            self.emit(text, meta)
+
+
+def split_trace(text):
+    if "\n" not in text:
+        return text, None
+    lines = text.splitlines()
+    if "Traceback (most recent call last)" in text:
+        tail = [l for l in lines if l.strip() and not l.startswith((" ", "\t")) and not l.startswith("Traceback")]
+        return (tail[-1] if tail else lines[0]).strip(), text
+    return lines[0].strip(), text
+
+
+def record_from_line(text, service, stream=None, extra=None):
+    """A log line (plain text or JSON) -> a Tracewise log record."""
+    rec = None
+    stripped = text.lstrip()
+    if stripped.startswith("{"):
+        try:
+            rec = json.loads(stripped)
+        except ValueError:
+            rec = None
+    if isinstance(rec, dict):
+        msg = rec.get("message") or rec.get("msg") or rec.get("log") or rec.get("text") or ""
+        if not isinstance(msg, str):
+            msg = json.dumps(msg)
+        err = rec.get("err") if isinstance(rec.get("err"), dict) else rec.get("error") if isinstance(rec.get("error"), dict) else {}
+        trace = (rec.get("stack") or rec.get("stacktrace") or rec.get("stack_trace") or rec.get("exc_info")
+                 or rec.get("trace") or err.get("stack"))
+        lvl = rec.get("level") or rec.get("severity") or rec.get("lvl") or rec.get("levelname")
+        level = level_of(lvl, msg + "\n" + str(trace or ""))
+        out = {"service": service, "level": level, "message": msg, "trace": trace,
+               "ts": rec.get("timestamp") or rec.get("time") or rec.get("ts") or rec.get("@timestamp"),
+               "fields": {k: v for k, v in rec.items() if isinstance(v, (str, int, float, bool))
+                          and k not in ("message", "msg", "level", "severity", "time", "timestamp", "ts")}}
+    else:
+        msg, trace = split_trace(text)
+        level = guess_level(text)
+        if trace and level in ("debug", "info"):
+            level = "error"
+        out = {"service": service, "level": level, "message": msg, "trace": trace, "ts": None, "fields": {}}
+    out["fields"].update(extra or {})
+    out["fields"]["host"] = HOST
+    out["ts"] = out["ts"] or now_iso()
+    return out
+
+
+# ====================================================================== shipping
+
+class Shipper:
+    """Buffers records and sends them every couple of seconds, retrying with backoff."""
+
+    def __init__(self, url, key, min_level="warning", dry_run=False, interval=2.0):
+        self.url, self.key = (url or "").rstrip("/"), key
+        self.min_level, self.dry_run, self.interval = min_level, dry_run, interval
+        self.lock = threading.Lock()
+        self.buffers = {"logs": [], "metrics": [], "events": [], "deploys": []}
+        self.dropped, self.sent = 0, {"logs": 0, "metrics": 0, "events": 0, "deploys": 0}
+        self.watchers = []
+        self.assemblers = []
+
+    def log(self, rec):
+        if rank(rec["level"]) < rank(self.min_level):
+            return
+        rec["message"] = rec["message"][:4000]
+        if rec.get("trace"):
+            rec["trace"] = rec["trace"][-6000:]
+        self._add("logs", rec)
+
+    def metric(self, rec):
+        self._add("metrics", rec)
+
+    def event(self, rec):
+        rec.setdefault("ts", now_iso())
+        rec.setdefault("detail", {})["host"] = HOST
+        self._add("events", rec)
+
+    def deploy(self, rec):
+        rec.setdefault("deployed_at", time.time())
+        self._add("deploys", rec)
+
+    def _add(self, kind, rec):
+        with self.lock:
+            buf = self.buffers[kind]
+            if len(buf) >= 50000:
+                buf.pop(0)
+                self.dropped += 1
+            buf.append(rec)
+
+    def start(self):
+        threading.Thread(target=self._loop, daemon=True).start()
+        threading.Thread(target=self._heartbeat, daemon=True).start()
+
+    def _loop(self):
+        while not STOP.is_set():
+            STOP.wait(self.interval)
+            self.flush()
+
+    def flush(self, final=False):
+        for a in list(self.assemblers):
+            a.tick(idle=0 if final else 0.3)
+        with self.lock:
+            batches = {k: v for k, v in self.buffers.items() if v}
+            self.buffers = {k: [] for k in self.buffers}
+        if "logs" in batches:
+            batches["logs"] = collapse(batches["logs"])
+        for kind, items in batches.items():
+            path = "/v1/ingest/deploys/generic" if kind == "deploys" else f"/v1/ingest/{kind}"
+            for chunk in (items[i:i + 2000] for i in range(0, len(items), 2000)):
+                if self.post(path, chunk):
+                    self.sent[kind] += len(chunk)
+                else:
+                    with self.lock:  # put back for the next attempt
+                        self.buffers[kind][:0] = chunk[-20000:]
+
+    def post(self, path, payload, attempts=1):
+        if self.dry_run:
+            for item in (payload if isinstance(payload, list) else [payload]):
+                print(json.dumps({"to": path, **item}, default=str), flush=True)
+            return True
+        body = gzip.compress(json.dumps(payload, default=str).encode())
+        req = urllib.request.Request(self.url + path, data=body, method="POST", headers={
+            "content-type": "application/json", "content-encoding": "gzip", "x-ingest-key": self.key or "",
+            "user-agent": f"tracewise-agent/{VERSION}", "x-tracewise-source": HOST})
+        for attempt in range(attempts):
+            try:
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    return 200 <= resp.status < 300
+            except urllib.error.HTTPError as exc:
+                if exc.code in (400, 401, 403, 404, 413):
+                    log(f"{path}: HTTP {exc.code} {exc.read()[:200]!r}")
+                    return exc.code in (400, 413)  # bad batch: drop it rather than retry forever
+            except (urllib.error.URLError, OSError) as exc:
+                if attempt == attempts - 1:
+                    log(f"can't reach {self.url}: {exc}; will retry")
+            time.sleep(min(2 ** attempt, 10))
+        return False
+
+    def _heartbeat(self):
+        while not STOP.is_set():
+            self.post("/v1/ingest/heartbeat", {
+                "host": HOST, "version": VERSION, "os": platform.platform(),
+                "watchers": [w.describe() for w in self.watchers], "sent": self.sent, "dropped": self.dropped,
+            })
+            STOP.wait(30)
+
+
+def collapse(logs):
+    """Identical (service, level, message) lines in one flush become one record with a count."""
+    out, index = [], {}
+    for rec in logs:
+        key = (rec.get("service"), rec.get("level"), rec.get("message"), rec.get("trace"))
+        if key in index:
+            out[index[key]]["count"] = out[index[key]].get("count", 1) + 1
+        else:
+            index[key] = len(out)
+            out.append(rec)
+    return out
+
+
+# ====================================================================== helpers
+
+def run_lines(cmd, on_line, env=None, restart=True, name=None):
+    """Run a command and feed its output lines to on_line, restarting it if it exits."""
+    def go():
+        backoff = 1
+        while not STOP.is_set():
+            try:
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                        text=True, errors="replace", env=env, bufsize=1)
+            except FileNotFoundError:
+                log(f"{cmd[0]} not found")
+                return
+            for line in proc.stdout:
+                on_line(line)
+                if STOP.is_set():
+                    break
+            proc.wait()
+            if not restart or STOP.is_set():
+                return
+            STOP.wait(backoff)
+            backoff = min(backoff * 2, 30)
+    t = threading.Thread(target=go, daemon=True, name=name or cmd[0])
+    t.start()
+    return t
+
+
+def capture(cmd, timeout=20):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ""
+
+
+def every(seconds, fn, name):
+    def go():
+        while not STOP.is_set():
+            try:
+                fn()
+            except Exception as exc:
+                log(f"{name}: {type(exc).__name__}: {exc}")
+            STOP.wait(seconds)
+    threading.Thread(target=go, daemon=True, name=name).start()
+
+
+class Tail:
+    """`tail -F`: follows a file across rotation and truncation, starting at the end."""
+
+    def __init__(self, path, on_line, from_start=False):
+        self.path, self.on_line, self.from_start = path, on_line, from_start
+
+    def start(self):
+        threading.Thread(target=self._run, daemon=True, name=f"tail {self.path}").start()
+
+    def _run(self):
+        f, inode, first = None, None, True
+        buf = ""
+        while not STOP.is_set():
+            try:
+                st = os.stat(self.path)
+            except FileNotFoundError:
+                STOP.wait(1)
+                continue
+            if f is None or st.st_ino != inode or st.st_size < f.tell():
+                if f:
+                    f.close()
+                f = open(self.path, "r", errors="replace")
+                inode = st.st_ino
+                if first and not self.from_start:
+                    f.seek(0, os.SEEK_END)
+                first = False
+            chunk = f.read(1 << 20)
+            if not chunk:
+                STOP.wait(0.25)
+                continue
+            buf += chunk
+            *lines, buf = buf.split("\n")
+            for line in lines:
+                self.on_line(line)
+
+
+# ====================================================================== watchers
+
+class Watcher:
+    def __init__(self, shipper, **opts):
+        self.shipper, self.opts = shipper, opts
+
+    def describe(self):
+        return {"type": self.type, **{k: v for k, v in self.opts.items() if v}}
+
+    def assembler(self, service, stream=None, extra=None):
+        a = Assembler(lambda text, meta: self.shipper.log(record_from_line(text, *meta)))
+        self.shipper.assemblers.append(a)
+        return lambda line: a.feed(line, (service, stream, extra))
+
+
+class Pm2(Watcher):
+    """pm2 apps: tails their log files (keeps stack traces intact) and watches restarts/crashes."""
+    type = "pm2"
+
+    def start(self):
+        self.seen, self.state = set(), {}
+        every(5, self.check, "pm2")
+
+    def apps(self):
+        out = capture(["pm2", "jlist"])
+        start = out.find("[")
+        try:
+            procs = json.loads(out[start:]) if start >= 0 else []
+        except ValueError:
+            return []
+        wanted = set(self.opts.get("apps") or [])
+        return [p for p in procs if not wanted or p.get("name") in wanted]
+
+    def check(self):
+        for p in self.apps():
+            env, name = p.get("pm2_env") or {}, p.get("name")
+            key = (name, p.get("pm_id"))
+            if key not in self.seen:
+                self.seen.add(key)
+                for path, stream in ((env.get("pm_out_log_path"), "stdout"), (env.get("pm_err_log_path"), "stderr")):
+                    if path and path != "/dev/null":
+                        Tail(path, self.assembler(name, stream, {"pm2_id": p.get("pm_id")})).start()
+            restarts, status = env.get("restart_time", 0), env.get("status")
+            revision = (env.get("versioning") or {}).get("revision")
+            prev = self.state.get(key)
+            if prev:
+                if restarts > prev["restarts"]:
+                    self.shipper.event({"service": name, "kind": "restart", "severity": "error",
+                                        "status": "firing", "title": f"{name} restarted by pm2 ({restarts} restarts so far, exit code {env.get('exit_code')})",
+                                        "detail": {"restarts": restarts, "unstable_restarts": env.get("unstable_restarts")}})
+                if status == "errored" and prev["status"] != "errored":
+                    self.shipper.event({"service": name, "kind": "crash", "severity": "critical", "status": "firing",
+                                        "fingerprint": f"pm2-errored:{HOST}:{name}", "sticky": True,
+                                        "title": f"{name} is errored in pm2 (gave up restarting)"})
+                elif status == "online" and prev["status"] == "errored":
+                    self.shipper.event({"service": name, "kind": "crash", "severity": "info", "status": "resolved",
+                                        "fingerprint": f"pm2-errored:{HOST}:{name}", "title": f"{name} is back online"})
+                if revision and prev.get("revision") and revision != prev["revision"]:
+                    self.shipper.deploy({"service": name, "sha": revision, "prev_sha": prev["revision"],
+                                         "actor": "pm2", "reason": f"pm2 restarted {name} on a new revision"})
+            self.state[key] = {"restarts": restarts, "status": status, "revision": revision}
+
+
+class Systemd(Watcher):
+    """systemd units: follows the journal and watches restarts and failures."""
+    type = "systemd"
+
+    def start(self):
+        units = [u if "." in u else f"{u}.service" for u in self.opts.get("units") or []]
+        self.units = units
+        user = ["--user"] if self.opts.get("user") else []
+        cmd = ["journalctl", *user, "-f", "-o", "json", "-n", "0", "--no-pager"]
+        for u in units:
+            cmd += ["-u", u]
+        if not units and not self.opts.get("all"):
+            log("systemd: pass --unit NAME (or --all to follow the whole journal)")
+            return
+        asm = {}
+
+        def on_line(line):
+            try:
+                e = json.loads(line)
+            except ValueError:
+                return
+            msg = e.get("MESSAGE")
+            if isinstance(msg, list):
+                msg = bytes(msg).decode("utf-8", "replace")
+            # USER_UNIT/UNIT: systemd's own messages about a unit ("Main process exited...");
+            # _SYSTEMD_USER_UNIT before _SYSTEMD_UNIT, which is user@UID.service for user units.
+            unit = (e.get("USER_UNIT") or e.get("UNIT") or e.get("_SYSTEMD_USER_UNIT")
+                    or e.get("_SYSTEMD_UNIT") or e.get("SYSLOG_IDENTIFIER") or "journal")
+            service = re.sub(r"\.service$", "", unit)
+            prio = int(e.get("PRIORITY", 6))
+            ts = int(e.get("__REALTIME_TIMESTAMP", time.time() * 1e6)) / 1e6
+            if service not in asm:
+                asm[service] = self.assembler(service, None, {"unit": unit})
+            # The journal's priority is often "info" for everything; keep the stronger signal.
+            line_level = level_of(prio)
+            text = msg or ""
+            if rank(line_level) > rank(guess_level(text)) and line_level in ("error", "critical"):
+                text = f"[{line_level.upper()}] {text}"
+            asm[service](text)
+
+        run_lines(cmd, on_line, name="journalctl")
+        if units:
+            self.state = {}
+            every(5, self.check, "systemctl")
+
+    def check(self):
+        user = ["--user"] if self.opts.get("user") else []
+        for unit in self.units:
+            out = capture(["systemctl", *user, "show", unit, "-p", "NRestarts", "-p", "ActiveState",
+                           "-p", "SubState", "-p", "Result", "-p", "ExecMainStatus"])
+            props = dict(l.split("=", 1) for l in out.splitlines() if "=" in l)
+            if not props:
+                continue
+            service = re.sub(r"\.service$", "", unit)
+            restarts = int(props.get("NRestarts") or 0)
+            prev = self.state.get(unit)
+            if prev:
+                if restarts > prev["restarts"]:
+                    self.shipper.event({"service": service, "kind": "restart", "severity": "error", "status": "firing",
+                                        "title": f"{unit} restarted by systemd ({restarts} restarts, result {props.get('Result')}, exit status {props.get('ExecMainStatus')})"})
+                if props.get("ActiveState") == "failed" and prev["active"] != "failed":
+                    self.shipper.event({"service": service, "kind": "crash", "severity": "critical", "status": "firing",
+                                        "fingerprint": f"systemd-failed:{HOST}:{unit}", "sticky": True,
+                                        "title": f"{unit} failed ({props.get('Result')}, exit status {props.get('ExecMainStatus')})"})
+                elif props.get("ActiveState") == "active" and prev["active"] == "failed":
+                    self.shipper.event({"service": service, "kind": "crash", "severity": "info", "status": "resolved",
+                                        "fingerprint": f"systemd-failed:{HOST}:{unit}", "title": f"{unit} is active again"})
+            self.state[unit] = {"restarts": restarts, "active": props.get("ActiveState")}
+
+
+class Docker(Watcher):
+    """Docker (or Podman) containers: follows logs, and watches crashes, OOM kills, restarts,
+    failed health checks and image changes (deploys)."""
+    type = "docker"
+
+    def start(self):
+        self.bin = self.opts.get("runtime") or "docker"
+        self.following, self.images = set(), {}
+        every(10, self.discover, "docker ps")
+        run_lines([self.bin, "events", "--format", "{{json .}}", "--filter", "type=container"],
+                  self.on_event, name="docker events")
+
+    def service_of(self, labels, name):
+        return (labels.get("com.docker.compose.service") or labels.get("com.docker.swarm.service.name")
+                or labels.get("io.kubernetes.container.name") or labels.get("app") or name)
+
+    def wanted(self, name, labels):
+        names = self.opts.get("containers") or []
+        if names and name not in names and self.service_of(labels, name) not in names:
+            return False
+        sel = self.opts.get("label")
+        if sel:
+            k, _, v = sel.partition("=")
+            return labels.get(k) == v if v else k in labels
+        return True
+
+    def discover(self):
+        for line in capture([self.bin, "ps", "--no-trunc", "--format", "{{json .}}"]).splitlines():
+            try:
+                c = json.loads(line)
+            except ValueError:
+                continue
+            labels = dict(kv.split("=", 1) for kv in (c.get("Labels") or "").split(",") if "=" in kv) \
+                if isinstance(c.get("Labels"), str) else (c.get("Labels") or {})
+            name = c.get("Names") if isinstance(c.get("Names"), str) else (c.get("Names") or ["?"])[0]
+            cid = c.get("ID") or c.get("Id")
+            if not self.wanted(name, labels) or cid in self.following:
+                continue
+            self.following.add(cid)
+            service = self.service_of(labels, name)
+            image = c.get("Image")
+            prev = self.images.get(service)
+            if prev and image and prev != image:
+                self.shipper.deploy({"service": service, "sha": image.split("@")[-1].split(":")[-1][:40] or image,
+                                     "prev_sha": prev, "actor": self.bin, "message": f"container now runs {image}"})
+            self.images[service] = image
+            feed = self.assembler(service, None, {"container": name})
+
+            def on_line(line, feed=feed):
+                # `docker logs -t` prefixes each line with an RFC 3339 timestamp
+                ts, _, rest = line.partition(" ")
+                feed(rest if re.match(r"\d{4}-\d\d-\d\dT", ts) else line)
+
+            def done(cid=cid):
+                self.following.discard(cid)
+
+            t = run_lines([self.bin, "logs", "-f", "-t", "--since", "1s", cid], on_line, restart=False,
+                          name=f"logs {name}")
+            threading.Thread(target=lambda t=t, d=done: (t.join(), d()), daemon=True).start()
+
+    def on_event(self, line):
+        try:
+            e = json.loads(line)
+        except ValueError:
+            return
+        attrs = (e.get("Actor") or {}).get("Attributes") or {}
+        name = attrs.get("name", "?")
+        if not self.wanted(name, attrs):
+            return
+        service = self.service_of(attrs, name)
+        action = e.get("Action") or e.get("status") or ""
+        if action == "die" and attrs.get("exitCode") not in (None, "0"):
+            code = attrs.get("exitCode")
+            self.shipper.event({"service": service, "kind": "crash", "severity": "error", "status": "firing",
+                                "title": f"container {name} exited with code {code}" + (" (killed: out of memory?)" if code == "137" else ""),
+                                "detail": {"image": attrs.get("image"), "exit_code": code}})
+        elif action == "oom":
+            self.shipper.event({"service": service, "kind": "oom", "severity": "critical", "status": "firing",
+                                "title": f"container {name} was OOM-killed", "detail": {"image": attrs.get("image")}})
+        elif action == "restart":
+            self.shipper.event({"service": service, "kind": "restart", "severity": "warning", "status": "firing",
+                                "title": f"container {name} restarted"})
+        elif action.startswith("health_status"):
+            healthy = action.endswith("healthy") and not action.endswith("unhealthy")
+            self.shipper.event({"service": service, "kind": "unhealthy", "severity": "info" if healthy else "error",
+                                "status": "resolved" if healthy else "firing", "sticky": True,
+                                "fingerprint": f"docker-health:{HOST}:{name}",
+                                "title": f"container {name} is {'healthy' if healthy else 'failing its health check'}"})
+
+
+class Kubernetes(Watcher):
+    """Kubernetes pods via kubectl: follows container logs, and watches restarts, OOM kills,
+    CrashLoopBackOff/ImagePullBackOff and image changes (deploys)."""
+    type = "kubernetes"
+
+    def kubectl(self, *args):
+        cmd = ["kubectl"]
+        if self.opts.get("context"):
+            cmd += ["--context", self.opts["context"]]
+        ns = self.opts.get("namespace")
+        cmd += ["--all-namespaces"] if ns in ("all", "*") and args[0] == "get" else (["-n", ns] if ns else [])
+        return cmd + list(args)
+
+    def start(self):
+        self.following, self.restarts, self.waiting, self.images = set(), {}, {}, {}
+        every(10, self.check, "kubectl")
+
+    @staticmethod
+    def service_of(pod):
+        labels = pod["metadata"].get("labels") or {}
+        for key in ("app.kubernetes.io/name", "app", "k8s-app", "app.kubernetes.io/instance", "component"):
+            if labels.get(key):
+                return labels[key]
+        owners = pod["metadata"].get("ownerReferences") or [{}]
+        name = owners[0].get("name") or pod["metadata"]["name"]
+        return re.sub(r"-[a-f0-9]{8,10}$", "", name) if owners[0].get("kind") == "ReplicaSet" else name
+
+    def check(self):
+        args = ["get", "pods", "-o", "json"]
+        if self.opts.get("selector"):
+            args += ["-l", self.opts["selector"]]
+        out = capture(self.kubectl(*args), timeout=30)
+        try:
+            pods = json.loads(out).get("items", [])
+        except ValueError:
+            return
+        for pod in pods:
+            meta, status = pod["metadata"], pod.get("status") or {}
+            service, ns = self.service_of(pod), meta.get("namespace", "default")
+            for cs in status.get("containerStatuses") or []:
+                key = (ns, meta["name"], cs["name"])
+                image = cs.get("image")
+                svc_key = (ns, service, cs["name"])
+                prev_image = self.images.get(svc_key)
+                if prev_image and image and image != prev_image and cs.get("ready"):
+                    self.shipper.deploy({"service": service, "sha": image.split(":")[-1][:40], "prev_sha": prev_image.split(":")[-1][:40],
+                                         "actor": "kubernetes", "message": f"{cs['name']} now runs {image}"})
+                if image and cs.get("ready"):
+                    self.images[svc_key] = image
+                restarts = cs.get("restartCount", 0)
+                if key in self.restarts and restarts > self.restarts[key]:
+                    term = (cs.get("lastState") or {}).get("terminated") or {}
+                    reason = term.get("reason") or "restart"
+                    self.shipper.event({"service": service, "kind": "oom" if reason == "OOMKilled" else "restart",
+                                        "severity": "critical" if reason == "OOMKilled" else "error", "status": "firing",
+                                        "title": f"{meta['name']}/{cs['name']} restarted ({reason}, exit code {term.get('exitCode')}; {restarts} restarts)",
+                                        "detail": {"namespace": ns, "pod": meta["name"], "message": term.get("message")}})
+                self.restarts[key] = restarts
+                waiting = ((cs.get("state") or {}).get("waiting") or {}).get("reason")
+                bad = waiting in ("CrashLoopBackOff", "ImagePullBackOff", "ErrImagePull", "CreateContainerConfigError",
+                                  "CreateContainerError", "RunContainerError", "InvalidImageName")
+                fp = f"k8s:{ns}/{meta['name']}/{cs['name']}"
+                if bad and self.waiting.get(fp) != waiting:
+                    self.shipper.event({"service": service, "kind": "crash", "severity": "critical", "status": "firing",
+                                        "fingerprint": fp, "sticky": True,
+                                        "title": f"{meta['name']}/{cs['name']} is in {waiting}: {((cs.get('state') or {}).get('waiting') or {}).get('message', '')}"[:400]})
+                elif not bad and self.waiting.get(fp):
+                    self.shipper.event({"service": service, "kind": "crash", "severity": "info", "status": "resolved",
+                                        "fingerprint": fp, "title": f"{meta['name']}/{cs['name']} recovered"})
+                self.waiting[fp] = waiting if bad else None
+                if (cs.get("state") or {}).get("running") and key not in self.following and len(self.following) < 100:
+                    self.following.add(key)
+                    feed = self.assembler(service, None, {"namespace": ns, "pod": meta["name"], "container": cs["name"]})
+
+                    def on_line(line, feed=feed):
+                        ts, _, rest = line.partition(" ")
+                        feed(rest if re.match(r"\d{4}-\d\d-\d\dT", ts) else line)
+
+                    t = run_lines(["kubectl", *(["--context", self.opts["context"]] if self.opts.get("context") else []),
+                                   "-n", ns, "logs", "-f", "--timestamps", "--since=1s", meta["name"], "-c", cs["name"]],
+                                  on_line, restart=False, name=f"logs {meta['name']}")
+                    threading.Thread(target=lambda t=t, k=key: (t.join(), self.following.discard(k)), daemon=True).start()
+
+
+ACCESS = re.compile(
+    r'^(?P<ip>\S+) \S+ \S+ \[(?P<time>[^\]]+)\] "(?P<method>[A-Z]+) (?P<path>\S+)[^"]*" (?P<status>\d{3}) (?P<bytes>\S+)'
+    r'(?: "[^"]*" "[^"]*")?(?P<rest>.*)$')
+
+
+class File(Watcher):
+    """Log files (with globs). Access logs (nginx/Apache combined, optional $request_time at the
+    end) also produce request metrics: request count, 5xx errors and latency percentiles."""
+    type = "file"
+
+    def start(self):
+        paths = []
+        for p in self.opts["paths"]:
+            paths += glob.glob(os.path.expanduser(p)) or [os.path.expanduser(p)]
+        self.window, self.lock = [], threading.Lock()
+        for path in paths:
+            service = self.opts.get("service") or re.sub(r"[-_.]?(access|error|out|err)?\.log.*$", "", os.path.basename(path)) or "app"
+            fmt = self.opts.get("format") or "auto"
+            feed = self.assembler(service, None, {"file": path})
+
+            def on_line(line, service=service, feed=feed, fmt=fmt, path=path):
+                if fmt in ("auto", "nginx", "apache", "access"):
+                    m = ACCESS.match(line)
+                    if m:
+                        return self.access(service, m, path)
+                    if fmt != "auto":
+                        return
+                feed(line)
+            Tail(path, on_line, from_start=self.opts.get("from_start", False)).start()
+        every(5, self.flush_metrics, "access metrics")
+
+    def access(self, service, m, path):
+        status = int(m.group("status"))
+        latency = None
+        nums = re.findall(r"(?<![\w.])(\d+\.\d{3})(?![\w.])", m.group("rest") or "")
+        if nums:
+            latency = float(nums[-1]) * 1000  # nginx $request_time / $upstream_response_time are seconds
+        with self.lock:
+            self.window.append((service, status, latency))
+        if status >= 500:
+            self.shipper.log({"service": service, "level": "error", "ts": now_iso(), "route": m.group("path")[:300],
+                              "status": status, "message": f"{m.group('method')} {m.group('path').split('?')[0]} -> {status}",
+                              "fields": {"file": path, "host": HOST}})
+
+    def flush_metrics(self):
+        with self.lock:
+            window, self.window = self.window, []
+        by = {}
+        for service, status, latency in window:
+            s = by.setdefault(service, {"count": 0, "errors": 0, "lat": []})
+            s["count"] += 1
+            s["errors"] += status >= 500
+            if latency is not None:
+                s["lat"].append(latency)
+        for service, s in by.items():
+            lat = sorted(s["lat"])
+            pick = (lambda p: round(lat[min(len(lat) - 1, int(len(lat) * p))], 1)) if lat else (lambda p: 0)
+            self.shipper.metric({"service": service, "ts": now_iso(), "count": s["count"], "errors": s["errors"],
+                                 "p50_ms": pick(0.5), "p95_ms": pick(0.95), "max_ms": lat[-1] if lat else 0})
+
+
+SYSLOG_5424 = re.compile(r"<(\d{1,3})>1 (\S+) (\S+) (\S+) (\S+) (\S+) (-|\[.*?\](?:\[.*?\])*) ?(.*)", re.S)
+SYSLOG_3164 = re.compile(r"<(\d{1,3})>(?:\w{3} [ \d]\d \d\d:\d\d:\d\d )?(\S+) ([^:\[\s]+)(?:\[\d+\])?: ?(.*)", re.S)
+
+
+class Syslog(Watcher):
+    """A syslog receiver (RFC 5424/3164, UDP and TCP) for devices and apps that only speak syslog."""
+    type = "syslog"
+
+    def start(self):
+        shipper = self.shipper
+        default = self.opts.get("service")
+
+        def handle(line):
+            line = line.strip("\r\n\x00")
+            if not line:
+                return
+            m = SYSLOG_5424.match(line)
+            if m:
+                pri, ts, host, app, msg = int(m.group(1)), m.group(2), m.group(3), m.group(4), m.group(8)
+            else:
+                m = SYSLOG_3164.match(line)
+                if m:
+                    pri, ts, host, app, msg = int(m.group(1)), None, m.group(2), m.group(3), m.group(4)
+                else:
+                    pri, ts, host, app, msg = 14, None, "?", "syslog", line
+            rec = record_from_line(msg, default or (app if app != "-" else host), extra={"syslog_host": host})
+            by_pri = level_of(pri & 7)
+            if rank(by_pri) > rank(rec["level"]):
+                rec["level"] = by_pri
+            rec["ts"] = ts if ts and ts != "-" else rec["ts"]
+            shipper.log(rec)
+
+        class UDP(socketserver.BaseRequestHandler):
+            def handle(self):
+                for line in self.request[0].decode("utf-8", "replace").splitlines():
+                    handle(line)
+
+        class TCP(socketserver.StreamRequestHandler):
+            def handle(self):
+                for raw in self.rfile:
+                    text = raw.decode("utf-8", "replace")
+                    head = text.split(" ", 1)[0]
+                    handle(text[len(head) + 1:] if head.isdigit() else text)
+
+        for spec in self.opts.get("listen") or ["udp://0.0.0.0:5514", "tcp://0.0.0.0:5514"]:
+            proto, _, addr = spec.partition("://")
+            host, _, port = addr.rpartition(":")
+            cls = socketserver.ThreadingUDPServer if proto == "udp" else socketserver.ThreadingTCPServer
+            cls.allow_reuse_address = True
+            server = cls((host or "0.0.0.0", int(port)), UDP if proto == "udp" else TCP)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            log(f"syslog listening on {spec}")
+
+
+class Http(Watcher):
+    """Synthetic checks of an HTTP endpoint: request metrics, plus a 'down' event when it fails."""
+    type = "http"
+
+    def start(self):
+        self.down = False
+        every(float(self.opts.get("interval") or 10), self.check, f"http {self.opts['url']}")
+
+    def check(self):
+        url, service, n = self.opts["url"], self.opts["service"], int(self.opts.get("requests") or 2)
+        lat, errors, detail = [], 0, ""
+        for _ in range(n):
+            started = time.perf_counter()
+            try:
+                with urllib.request.urlopen(url, timeout=float(self.opts.get("timeout") or 5)) as r:
+                    detail = f"HTTP {r.status}"
+            except urllib.error.HTTPError as exc:
+                detail = f"HTTP {exc.code}"
+                errors += exc.code >= 500
+            except Exception as exc:
+                detail = f"{type(exc).__name__}: {exc}"
+                errors += 1
+            lat.append((time.perf_counter() - started) * 1000)
+        lat.sort()
+        self.shipper.metric({"service": service, "ts": now_iso(), "count": n, "errors": errors,
+                             "p50_ms": round(lat[len(lat) // 2], 1), "p95_ms": round(lat[-1], 1), "max_ms": round(lat[-1], 1)})
+        if errors == n:
+            self.shipper.event({"service": service, "kind": "down", "severity": "critical", "status": "firing",
+                                "fingerprint": f"down:{url}", "sticky": True, "title": f"{url} is down: {detail}"})
+            self.shipper.log({"service": service, "level": "error", "message": f"health check {url} failed: {detail}",
+                              "ts": now_iso(), "fields": {"host": HOST}})
+        elif self.down:
+            self.shipper.event({"service": service, "kind": "down", "severity": "info", "status": "resolved",
+                                "fingerprint": f"down:{url}", "title": f"{url} is back"})
+        self.down = errors == n
+
+
+class Supervisor(Watcher):
+    """supervisord programs: follows their stdout/stderr and watches FATAL/BACKOFF/EXITED states."""
+    type = "supervisor"
+
+    def start(self):
+        self.state, self.following = {}, set()
+        every(5, self.check, "supervisorctl")
+
+    def check(self):
+        for line in capture(["supervisorctl", "status"]).splitlines():
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            prog, state = parts[0], parts[1]
+            if self.opts.get("programs") and prog.split(":")[0] not in self.opts["programs"]:
+                continue
+            service = prog.split(":")[0]
+            if prog not in self.following:
+                self.following.add(prog)
+                for stream in ("stdout", "stderr"):
+                    run_lines(["supervisorctl", "tail", "-f", prog, stream], self.assembler(service, stream),
+                              name=f"supervisor {prog}")
+            prev = self.state.get(prog)
+            if prev and prev != state and state in ("FATAL", "BACKOFF", "EXITED"):
+                self.shipper.event({"service": service, "kind": "crash", "severity": "critical" if state == "FATAL" else "error",
+                                    "status": "firing", "fingerprint": f"supervisor:{HOST}:{prog}", "sticky": True,
+                                    "title": f"{prog} is {state}: {' '.join(parts[2:])}"[:300]})
+            elif prev in ("FATAL", "BACKOFF", "EXITED") and state == "RUNNING":
+                self.shipper.event({"service": service, "kind": "crash", "severity": "info", "status": "resolved",
+                                    "fingerprint": f"supervisor:{HOST}:{prog}", "title": f"{prog} is running again"})
+            self.state[prog] = state
+
+
+class MacOS(Watcher):
+    """macOS unified log (`log stream`), for launchd services and apps."""
+    type = "macos"
+
+    def start(self):
+        cmd = ["log", "stream", "--style", "ndjson", "--level", "default"]
+        if self.opts.get("predicate"):
+            cmd += ["--predicate", self.opts["predicate"]]
+
+        def on_line(line):
+            try:
+                e = json.loads(line)
+            except ValueError:
+                return
+            if "eventMessage" not in e:
+                return
+            proc = os.path.basename(e.get("processImagePath") or "") or e.get("subsystem") or "macos"
+            level = {"Fault": "critical", "Error": "error"}.get(e.get("messageType"), None)
+            rec = record_from_line(e["eventMessage"], self.opts.get("service") or proc, extra={"subsystem": e.get("subsystem")})
+            if level and rank(level) > rank(rec["level"]):
+                rec["level"] = level
+            self.shipper.log(rec)
+        run_lines(cmd, on_line, name="log stream")
+
+
+WATCHERS = {w.type: w for w in (Pm2, Systemd, Docker, Kubernetes, File, Syslog, Http, Supervisor, MacOS)}
+
+
+# ====================================================================== detect / init
+
+SYSTEM_UNITS = re.compile(
+    r"^(systemd-|dbus|cron|ssh|getty|serial-getty|user@|polkit|udisks|upower|accounts-daemon|avahi|"
+    r"bluetooth|colord|cups|gdm|lightdm|networkd|NetworkManager|ModemManager|packagekit|rsyslog|"
+    r"snapd|thermald|unattended|wpa_supplicant|irqbalance|multipathd|rtkit|switcheroo|power-profiles|"
+    r"kerneloops|fwupd|gnome-|at-spi|xdg-|pipewire|wireplumber|pulseaudio|dconf|evolution|gvfs|"
+    r"tracker-|containerd|docker|chrony|ntp|atd|auditd|lvm2|blk-|plymouth|console-|kmod|apparmor|"
+    r"ufw|iscsid|open-vm|qemu-guest|cloud-|google-|amazon-|waagent|walinuxagent|tailscale|zfs)", re.I)
+
+
+def detect():
+    found = []
+    if shutil.which("pm2"):
+        apps = sorted({p.get("name") for p in Pm2(None).apps()})
+        if apps:
+            found.append({"type": "pm2", "apps": apps})
+    if shutil.which("systemctl"):
+        for user in (False, True):
+            out = capture(["systemctl", *(["--user"] if user else []), "list-units", "--type=service",
+                           "--state=running", "--no-legend", "--plain", "--no-pager"])
+            units = [l.split()[0] for l in out.splitlines() if l.strip()]
+            units = [re.sub(r"\.service$", "", u) for u in units if not SYSTEM_UNITS.match(u)]
+            if units:
+                found.append({"type": "systemd", "units": sorted(units), **({"user": True} if user else {})})
+    for runtime in ("docker", "podman"):
+        if shutil.which(runtime):
+            names = [l.strip() for l in capture([runtime, "ps", "--format", "{{.Names}}"]).splitlines() if l.strip()]
+            if names:
+                found.append({"type": "docker", "containers": sorted(names), **({"runtime": runtime} if runtime != "docker" else {})})
+    if shutil.which("kubectl"):
+        ctx = capture(["kubectl", "config", "current-context"]).strip()
+        if ctx:
+            found.append({"type": "kubernetes", "context": ctx, "namespace": "default"})
+    if shutil.which("supervisorctl") and capture(["supervisorctl", "status"]).strip():
+        found.append({"type": "supervisor"})
+    files = [p for pattern in ("/var/log/nginx/*access*.log", "/var/log/nginx/*error*.log", "/var/log/apache2/*.log",
+                               "/var/log/httpd/*log", "/var/log/caddy/*.log") for p in glob.glob(pattern)
+             if os.access(p, os.R_OK)]
+    for path in files:
+        found.append({"type": "file", "paths": [path], "service": "nginx" if "nginx" in path else "web",
+                      "format": "nginx" if "access" in path else "auto"})
+    if platform.system() == "Darwin":
+        found.append({"type": "macos", "predicate": 'messageType == error OR messageType == fault'})
+    return found
+
+
+# ====================================================================== commands
+
+def load_login():
+    try:
+        with open(CONFIG_PATH) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        data = {}
+    return (os.environ.get("TRACEWISE_URL") or data.get("url"), os.environ.get("TRACEWISE_KEY") or data.get("key"))
+
+
+def make_shipper(args, url=None, key=None):
+    url = url or args.url or load_login()[0]
+    key = key or args.key or load_login()[1]
+    if not url and not args.dry_run:
+        sys.exit("Not logged in: run `tracewise login --url URL --key KEY` (or set TRACEWISE_URL/TRACEWISE_KEY)")
+    return Shipper(url, key, min_level=args.min_level, dry_run=args.dry_run)
+
+
+def run_watchers(shipper, specs):
+    for spec in specs:
+        spec = dict(spec)
+        kind = spec.pop("type")
+        if kind not in WATCHERS:
+            log(f"unknown watcher type {kind!r}; skipping")
+            continue
+        w = WATCHERS[kind](shipper, **spec)
+        shipper.watchers.append(w)
+        w.start()
+        log(f"watching {kind}: {json.dumps(spec)}")
+    shipper.start()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda *_: STOP.set())
+    try:
+        while not STOP.is_set():
+            STOP.wait(1)
+    except KeyboardInterrupt:
+        STOP.set()
+    shipper.flush(final=True)
+
+
+def cmd_login(args):
+    url = args.url.rstrip("/")
+    s = Shipper(url, args.key)
+    try:
+        with urllib.request.urlopen(url + "/healthz", timeout=10) as r:
+            ok = r.status == 200
+    except Exception as exc:
+        sys.exit(f"Can't reach {url}: {exc}")
+    if not s.post("/v1/ingest/heartbeat", {"host": HOST, "version": VERSION, "watchers": [], "login": True}):
+        sys.exit("Tracewise rejected the key")
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        json.dump({"url": url, "key": args.key}, f)
+    os.chmod(CONFIG_PATH, 0o600)
+    print(f"Logged in to {url} as host {HOST}. Next: tracewise detect")
+
+
+def cmd_detect(args):
+    found = detect()
+    if not found:
+        print("Nothing found to watch automatically. Try `tracewise watch file PATH --service NAME`.")
+    for spec in found:
+        print(json.dumps(spec))
+
+
+def cmd_init(args):
+    found = detect()
+    if os.path.exists(args.config) and not args.force:
+        sys.exit(f"{args.config} exists; use --force to overwrite")
+    with open(args.config, "w") as f:
+        json.dump({"min_level": "warning", "watch": found}, f, indent=2)
+    print(f"Wrote {args.config} with {len(found)} watchers. Edit it, then run: tracewise run")
+
+
+def cmd_run(args):
+    try:
+        with open(args.config) as f:
+            cfg = json.load(f)
+    except OSError:
+        sys.exit(f"No {args.config}; run `tracewise init` first")
+    args.min_level = cfg.get("min_level", args.min_level)
+    run_watchers(make_shipper(args, cfg.get("url"), cfg.get("key")), cfg.get("watch", []))
+
+
+def cmd_watch(args):
+    spec = {"type": args.kind}
+    if args.kind == "pm2":
+        spec["apps"] = args.app
+    elif args.kind == "systemd":
+        spec.update(units=args.unit, user=args.user, all=args.all)
+    elif args.kind == "docker":
+        spec.update(containers=args.container, label=args.label, runtime=args.runtime)
+    elif args.kind == "kubernetes":
+        spec.update(namespace=args.namespace, selector=args.selector, context=args.context)
+    elif args.kind == "file":
+        if not args.target:
+            sys.exit("tracewise watch file PATH [PATH...] --service NAME")
+        spec.update(paths=args.target, service=args.service, format=args.format, from_start=args.from_start)
+    elif args.kind == "syslog":
+        spec.update(listen=args.listen, service=args.service)
+    elif args.kind == "http":
+        if not args.target or not args.service:
+            sys.exit("tracewise watch http URL --service NAME")
+        spec.update(url=args.target[0], service=args.service, interval=args.interval)
+    elif args.kind == "supervisor":
+        spec["programs"] = args.program
+    elif args.kind == "macos":
+        spec.update(predicate=args.predicate, service=args.service)
+    run_watchers(make_shipper(args), [spec])
+
+
+def cmd_exec(args):
+    """Run a command, pass its output through, ship its logs, and report a crash on failure."""
+    if not args.command:
+        sys.exit("tracewise exec --service NAME -- COMMAND [ARGS...]")
+    cmd = args.command[1:] if args.command[0] == "--" else args.command
+    shipper = make_shipper(args)
+    shipper.start()
+    w = Watcher(shipper)
+    w.type = "exec"
+    w.opts = {"service": args.service, "command": " ".join(cmd)}
+    shipper.watchers.append(w)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace", bufsize=1)
+
+    def pump(pipe, out, stream):
+        feed = w.assembler(args.service, stream)
+        for line in pipe:
+            out.write(line)
+            out.flush()
+            feed(line)
+    threads = [threading.Thread(target=pump, args=(proc.stdout, sys.stdout, "stdout"), daemon=True),
+               threading.Thread(target=pump, args=(proc.stderr, sys.stderr, "stderr"), daemon=True)]
+    for t in threads:
+        t.start()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda s, _f: proc.send_signal(s))
+    code = proc.wait()
+    for t in threads:
+        t.join(timeout=2)
+    if code != 0:
+        shipper.event({"service": args.service, "kind": "crash", "severity": "error", "status": "firing",
+                       "title": f"{os.path.basename(cmd[0])} {' '.join(cmd[1:])}".splitlines()[0][:80]
+                                + f" exited with code {code}"})
+    shipper.flush(final=True)
+    sys.exit(code)
+
+
+def git_value(*args):
+    return capture(["git", *args]).strip() or None
+
+
+def cmd_deploy(args):
+    sha = args.sha or os.environ.get("GITHUB_SHA") or os.environ.get("CI_COMMIT_SHA") or git_value("rev-parse", "HEAD")
+    if not sha:
+        sys.exit("No --sha and not in a git repo")
+    rec = {"service": args.service, "sha": sha,
+           "prev_sha": args.prev_sha, "message": args.message or git_value("log", "-1", "--format=%s", sha),
+           "author": args.author or git_value("log", "-1", "--format=%an", sha),
+           "actor": args.actor or os.environ.get("GITHUB_ACTOR") or os.environ.get("GITLAB_USER_LOGIN") or os.environ.get("USER"),
+           "reason": args.reason, "deployed_at": time.time()}
+    s = make_shipper(args)
+    if not s.post("/v1/ingest/deploys/generic", rec, attempts=3):
+        sys.exit("Couldn't record the deploy")
+    print(f"Recorded deploy of {args.service} at {sha[:10]}")
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="tracewise", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--version", action="version", version=f"tracewise-agent {VERSION}")
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--url", help="Tracewise URL (default: from `tracewise login`)")
+    common.add_argument("--key", help="Ingest key (default: from `tracewise login`)")
+    common.add_argument("--min-level", default="warning", choices=LEVELS, help="Lowest log level to ship (default: warning)")
+    common.add_argument("--dry-run", action="store_true", help="Print what would be sent instead of sending it")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("login", help="Save the Tracewise URL and ingest key")
+    s.add_argument("--url", required=True)
+    s.add_argument("--key", required=True)
+    s.set_defaults(fn=cmd_login)
+
+    sub.add_parser("detect", help="List what can be watched on this machine").set_defaults(fn=cmd_detect)
+
+    s = sub.add_parser("init", help="Write tracewise.json from what `detect` finds")
+    s.add_argument("--config", default="tracewise.json")
+    s.add_argument("--force", action="store_true")
+    s.set_defaults(fn=cmd_init)
+
+    s = sub.add_parser("run", parents=[common], help="Run every watcher in tracewise.json")
+    s.add_argument("--config", default="tracewise.json")
+    s.set_defaults(fn=cmd_run)
+
+    s = sub.add_parser("watch", parents=[common], help="Watch one thing")
+    s.add_argument("kind", choices=sorted(WATCHERS))
+    s.add_argument("target", nargs="*", help="file paths (file) or URL (http)")
+    s.add_argument("--service", help="Service name to report as")
+    s.add_argument("--app", action="append", help="pm2 app (repeatable; default all)")
+    s.add_argument("--unit", action="append", help="systemd unit (repeatable)")
+    s.add_argument("--user", action="store_true", help="systemd user units")
+    s.add_argument("--all", action="store_true", help="systemd: follow the whole journal")
+    s.add_argument("--container", action="append", help="container or compose service (repeatable; default all)")
+    s.add_argument("--label", help="docker: only containers with this label (k or k=v)")
+    s.add_argument("--runtime", choices=["docker", "podman"], help="container runtime")
+    s.add_argument("--namespace", help="kubernetes namespace ('all' for every namespace)")
+    s.add_argument("--selector", "-l", help="kubernetes label selector")
+    s.add_argument("--context", help="kubectl context")
+    s.add_argument("--format", choices=["auto", "nginx", "apache", "json", "plain"], default="auto")
+    s.add_argument("--from-start", action="store_true", help="file: read existing content too")
+    s.add_argument("--listen", action="append", help="syslog: udp://0.0.0.0:5514 (repeatable)")
+    s.add_argument("--interval", type=float, default=10, help="http: seconds between checks")
+    s.add_argument("--program", action="append", help="supervisor program (repeatable)")
+    s.add_argument("--predicate", help="macos: log stream predicate")
+    s.set_defaults(fn=cmd_watch)
+
+    s = sub.add_parser("exec", parents=[common], help="Run a command and ship its output")
+    s.add_argument("--service", required=True)
+    s.add_argument("command", nargs=argparse.REMAINDER)
+    s.set_defaults(fn=cmd_exec)
+
+    s = sub.add_parser("deploy", parents=[common], help="Record a deploy (run it from CI)")
+    s.add_argument("--service", required=True)
+    s.add_argument("--sha")
+    s.add_argument("--prev-sha")
+    s.add_argument("--message")
+    s.add_argument("--author")
+    s.add_argument("--actor")
+    s.add_argument("--reason")
+    s.set_defaults(fn=cmd_deploy)
+
+    args = p.parse_args(argv)
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()
