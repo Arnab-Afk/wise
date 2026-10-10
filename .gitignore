@@ -1,0 +1,8 @@
+.env
+demo/shopfront/
+__pycache__/
+*.pyc
+.venv/
+backend/vendor/
+.runner-work/
+.lab/
