@@ -1,0 +1,18 @@
+# Runs coding agents (Claude / Cursor) on fix jobs. Separate from the api/worker image because
+# the agent CLIs are large.
+FROM python:3.12-slim
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates ripgrep \
+    && rm -rf /var/lib/apt/lists/*
+ENV HOME=/opt/tw-home PATH=/opt/tw-home/.local/bin:/opt/agents/bin:$PATH
+COPY vendor/bin/ $HOME/.local/bin/
+COPY vendor/share/ $HOME/.local/share/
+RUN ln -sf $HOME/.local/share/entire/plugins/pkg/graph/entire-graph \
+      $HOME/.local/share/entire/plugins/bin/entire-graph && chmod -R a+rwX $HOME
+COPY vendor/agents/claude /opt/agents/bin/claude
+COPY vendor/agents/cursor /opt/agents/cursor
+RUN ln -s /opt/agents/cursor/cursor-agent /opt/agents/bin/agent && claude --version && agent --version
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt pytest pyyaml fastapi httpx uvicorn
+RUN git config --system --add safe.directory '*'
+COPY tracewise /app/tracewise
+WORKDIR /app
