@@ -1,0 +1,8 @@
+groups:
+  - name: lab
+    rules:
+      - alert: HighErrorRate
+        expr: sum by (service) (rate(http_requests_total{status=~"5.."}[30s])) / sum by (service) (rate(http_requests_total[30s])) > 0.2
+        for: 10s
+        labels: {severity: critical}
+        annotations: {summary: "{{ $labels.service }} is failing {{ $value | humanizePercentage }} of requests"}

@@ -1,0 +1,42 @@
+[sources.lab]
+type = "file"
+include = ["/logs/*.log"]
+read_from = "end"
+
+[transforms.parsed]
+type = "remap"
+inputs = ["lab"]
+source = '''
+. = parse_json!(.message)
+'''
+
+[sinks.tracewise_http]
+type = "http"
+inputs = ["parsed"]
+uri = "http://api:8000/v1/ingest/logs?source=vector-http"
+encoding.codec = "json"
+request.headers.x-ingest-key = "__KEY__"
+compression = "gzip"
+
+[sinks.tracewise_loki]
+type = "loki"
+inputs = ["parsed"]
+endpoint = "http://api:8000"
+path = "/loki/api/v1/push?source=vector-loki"
+encoding.codec = "json"
+labels.service = "{{ service }}"
+auth.strategy = "bearer"
+auth.token = "__KEY__"
+
+[sinks.tracewise_hec]
+type = "splunk_hec_logs"
+inputs = ["parsed"]
+endpoint = "http://api:8000/splunk"
+default_token = "__KEY__"
+encoding.codec = "json"
+
+[sinks.tracewise_dd]
+type = "datadog_logs"
+inputs = ["parsed"]
+endpoint = "http://api:8000/datadog"
+default_api_key = "__KEY__"

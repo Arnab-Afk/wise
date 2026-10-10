@@ -1,0 +1,7 @@
+route: {receiver: tracewise, group_wait: 5s, group_interval: 10s, repeat_interval: 1m}
+receivers:
+  - name: tracewise
+    webhook_configs:
+      - url: http://api:8000/v1/ingest/alerts/alertmanager
+        send_resolved: true
+        http_config: {authorization: {credentials: "__KEY__"}}

@@ -1,0 +1,90 @@
+# Connector lab: real observability tools sending to, and being read by, Tracewise.
+# Start with ./up.sh (fills in the ingest key). Joins the main stack's network.
+name: tracewise-lab
+
+x-lab: &lab
+  restart: unless-stopped
+  networks: [tw]
+
+services:
+  orders:
+    <<: *lab
+    build: ./app
+    container_name: lab-orders
+    environment: {SERVICE: lab-orders, DOWNSTREAM: "lab-stock:8080"}
+    labels: {lab: "1"}
+    volumes: [labs-logs:/logs]
+    ports: ["19135:8080"]
+  stock:
+    <<: *lab
+    build: ./app
+    container_name: lab-stock
+    environment: {SERVICE: lab-stock}
+    labels: {lab: "1"}
+    volumes: [labs-logs:/logs]
+    ports: ["19136:8080"]
+
+  prometheus:
+    <<: *lab
+    image: prom/prometheus:v2.54.1
+    container_name: lab-prometheus
+    volumes: ["./.gen/prometheus.yml:/etc/prometheus/prometheus.yml:ro", "./.gen/rules.yml:/etc/prometheus/rules.yml:ro"]
+    ports: ["19131:9090"]
+  alertmanager:
+    <<: *lab
+    image: prom/alertmanager:v0.27.0
+    container_name: lab-alertmanager
+    volumes: ["./.gen/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro"]
+    ports: ["19134:9093"]
+  loki:
+    <<: *lab
+    image: grafana/loki:3.2.0
+    container_name: lab-loki
+    ports: ["19132:3100"]
+  promtail:
+    <<: *lab
+    image: grafana/promtail:3.2.0
+    container_name: lab-promtail
+    command: ["-config.file=/etc/promtail/promtail.yml"]
+    volumes: ["./.gen/promtail.yml:/etc/promtail/promtail.yml:ro", "/var/run/docker.sock:/var/run/docker.sock:ro"]
+  grafana:
+    <<: *lab
+    image: grafana/grafana:11.2.2
+    container_name: lab-grafana
+    environment: {GF_SECURITY_ADMIN_PASSWORD: labadmin}
+    volumes: ["./.gen/grafana-datasources.yml:/etc/grafana/provisioning/datasources/lab.yml:ro"]
+    ports: ["19130:3000"]
+  opensearch:
+    <<: *lab
+    image: opensearchproject/opensearch:2.17.1
+    container_name: lab-opensearch
+    environment:
+      discovery.type: single-node
+      DISABLE_SECURITY_PLUGIN: "true"
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+      OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
+    ports: ["19133:9200"]
+  fluentbit:
+    <<: *lab
+    image: fluent/fluent-bit:3.1.9
+    container_name: lab-fluentbit
+    volumes: ["./.gen/fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro", "./.gen/parsers.conf:/fluent-bit/etc/lab-parsers.conf:ro", "labs-logs:/logs:ro"]
+  vector:
+    <<: *lab
+    image: timberio/vector:0.41.1-debian
+    container_name: lab-vector
+    volumes: ["./.gen/vector.toml:/etc/vector/vector.toml:ro", "labs-logs:/logs:ro"]
+    command: ["--config", "/etc/vector/vector.toml"]
+  otelcol:
+    <<: *lab
+    image: otel/opentelemetry-collector-contrib:0.111.0
+    container_name: lab-otelcol
+    volumes: ["./.gen/otelcol.yml:/etc/otelcol-contrib/config.yaml:ro"]
+
+volumes:
+  labs-logs:
+
+networks:
+  tw:
+    name: tracewise_default
+    external: true

@@ -1,0 +1,11 @@
+receivers:
+  otlp:
+    protocols: {http: {endpoint: 0.0.0.0:4318}, grpc: {endpoint: 0.0.0.0:4317}}
+exporters:
+  otlphttp/tracewise:
+    endpoint: http://api:8000/otlp
+    headers: {x-ingest-key: "__KEY__"}
+service:
+  pipelines:
+    traces: {receivers: [otlp], exporters: [otlphttp/tracewise]}
+    logs: {receivers: [otlp], exporters: [otlphttp/tracewise]}
