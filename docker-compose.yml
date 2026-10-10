@@ -65,6 +65,16 @@ services:
       - ./backend/tracewise:/app/tracewise:ro
       - ./.runner-work:/work
 
+  web:
+    build: ./web
+    environment:
+      TRACEWISE_API_URL: http://api:8000
+    ports:
+      - "19103:3000"
+    depends_on:
+      - api
+    restart: unless-stopped
+
   shopfront:
     build:
       context: ./demo

@@ -112,6 +112,7 @@ docker compose up -d --build
 
 | Port | What |
 |---|---|
+| 19103 | Tracewise web console (incidents, live timeline and replay, services, deploys, fixes, sources, coding agents) |
 | 19100 | Tracewise API (`/v1/incidents`, `/v1/health`, `/v1/topology`, `/v1/stream` SSE) |
 | 19101 | Shopfront gateway |
 | 19102 | Shopfront deployer (`/services`, `/deploy`, `/rollback`, `/flags`) |

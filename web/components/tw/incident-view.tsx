@@ -60,13 +60,12 @@ export function IncidentView({ id }: { id: string }) {
   const bottom = useRef<HTMLDivElement>(null);
 
   const load = useCallback(() => {
-    api<IncidentDetail>(`/v1/incidents/${id}`).then(setIncident).catch(() => setMissing(true));
+    api<IncidentDetail>(`/v1/incidents/${id}`).then((d) => { setIncident(d); setNow(Date.now()); }).catch(() => setMissing(true));
   }, [id]);
   useEffect(() => { load(); }, [load]);
 
   const live = incident ? ACTIVE.includes(incident.status) : false;
   useEffect(() => {
-    setNow(Date.now());
     if (!live) return;
     const t = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(t);
@@ -381,7 +380,7 @@ function Properties({ incident, now }: { incident: IncidentDetail; now: number }
   const firstAction = incident.steps.find((s) => s.kind === "action");
   const hyp = [...incident.steps].reverse().find((s) => s.kind === "hypotheses");
   const top = Math.max(0, ...((hyp?.data?.input?.hypotheses ?? []) as any[]).map((h) => h.confidence ?? 0));
-  const tools = incident.steps.filter((s) => s.kind === "tool").length;
+  const tools = incident.steps.filter((s) => s.data?.tool).length;
   const rows: [string, React.ReactNode][] = [
     ["Status", <StatusPill key="s" status={incident.status} />],
     ["Severity", <Pill key="v" tone={incident.severity === "critical" ? "bad" : "warn"}>{incident.severity}</Pill>],
