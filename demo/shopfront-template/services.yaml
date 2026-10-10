@@ -1,0 +1,9 @@
+# Shopfront services and the ports they listen on inside the runtime.
+services:
+  gateway: 7101
+  checkout: 7102
+  payments: 7103
+  bank: 7104
+  catalog: 7105
+  inventory: 7106
+  orders: 7107
