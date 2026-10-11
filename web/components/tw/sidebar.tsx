@@ -1,5 +1,6 @@
 "use client";
 
+import { Mark } from "@/components/tw/logo";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useState } from "react";
@@ -117,7 +118,7 @@ export function WorkspaceBadge() {
   const ws = me?.workspace;
   return (
     <div className="flex items-center gap-1.5">
-      <span className="flex size-7 shrink-0 items-center justify-center rounded-lg bg-foreground font-mono text-[13px] font-semibold text-background">T</span>
+      <Mark size={28} />
       <span className="text-muted-foreground/50">/</span>
       <DropdownMenu onOpenChange={(open) => { if (open) api<WorkspaceRow[]>("/v1/workspaces").then(setRows).catch(() => {}); }}>
         <DropdownMenuTrigger className="flex min-w-0 flex-1 items-center gap-2 rounded-lg px-1.5 py-1 text-left outline-none hover:bg-foreground/[0.05]">

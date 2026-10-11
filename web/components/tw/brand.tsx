@@ -1,10 +1,3 @@
-export function Logo({ size = 28 }: { size?: number }) {
-  return (
-    <span className="flex items-center justify-center rounded-lg bg-foreground font-mono font-semibold text-background"
-      style={{ width: size, height: size, fontSize: size * 0.46 }}>T</span>
-  );
-}
-
 export function GoogleIcon() {
   return (
     <svg viewBox="0 0 24 24" className="size-4" aria-hidden>

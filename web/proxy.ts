@@ -5,10 +5,10 @@ export function proxy(request: NextRequest) {
   if (request.cookies.has("tw_session")) return NextResponse.next();
   const login = new URL("/login", request.url);
   const next = request.nextUrl.pathname + request.nextUrl.search;
-  if (next !== "/") login.searchParams.set("next", next);
+  login.searchParams.set("next", next);
   return NextResponse.redirect(login);
 }
 
 export const config = {
-  matcher: ["/((?!login|signup|invite|api|_next|favicon.ico|.*\\..*).*)"],
+  matcher: ["/((?!$|login|signup|invite|terms|privacy|api|_next|favicon.ico|.*\\..*).*)"],
 };

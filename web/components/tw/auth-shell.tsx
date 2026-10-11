@@ -1,13 +1,9 @@
+import Link from "next/link";
+import { Logo } from "@/components/tw/logo";
 import { GlyphField } from "@/components/tw/glyph-field";
 
 export function Wordmark({ dark }: { dark?: boolean }) {
-  return (
-    <span className="flex items-center gap-2.5">
-      <span className={dark ? "flex size-7 items-center justify-center rounded-lg bg-white font-mono text-[13px] font-semibold text-black"
-        : "flex size-7 items-center justify-center rounded-lg bg-foreground font-mono text-[13px] font-semibold text-background"}>T</span>
-      <span className={dark ? "font-mono text-[15px] text-white" : "font-mono text-[15px]"}>tracewise</span>
-    </span>
-  );
+  return <Link href="/" aria-label="Tracewise home"><Logo size={28} inverted={dark} /></Link>;
 }
 
 /** Split screen, after the iac console: a dark brand panel and a light form panel. */

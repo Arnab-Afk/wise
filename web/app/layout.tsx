@@ -10,6 +10,7 @@ const mono = Geist_Mono({ variable: "--font-geist-mono", subsets: ["latin"] });
 const serif = Instrument_Serif({ variable: "--font-instrument-serif", subsets: ["latin"], weight: "400" });
 
 export const metadata: Metadata = {
+  metadataBase: new URL("https://wise.arnabbhowmik.in"),
   title: "Tracewise",
   description: "The on-call agent that fixes production and shows its work.",
 };

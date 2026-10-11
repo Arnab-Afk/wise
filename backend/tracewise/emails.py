@@ -81,8 +81,8 @@ def render(e: Email) -> dict:
   <tr><td style="padding:20px;font-family:{FONT};color:#000000;">
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
     <tr><td align="center" style="padding-top:12px;">
-      <span style="display:inline-block;width:24px;height:24px;line-height:24px;background:#000000;color:#ffffff;border-radius:6px;font-family:{MONO};font-size:13px;font-weight:600;text-align:center;vertical-align:middle;">T</span>
-      <span style="font-family:{MONO};font-size:18px;color:#000000;vertical-align:middle;margin-left:6px;">tracewise</span>
+      <img src="{WEB_URL}/brand/mark-48.png" width="24" height="24" alt="" style="display:inline-block;width:24px;height:24px;border:0;border-radius:6px;vertical-align:middle;">
+      <span style="font-family:{FONT};font-size:18px;font-weight:600;letter-spacing:-0.02em;color:#15181A;vertical-align:middle;margin-left:6px;">tracewise</span>
     </td></tr>
     </table>
     <h1 style="margin:30px 0;padding:0;font-size:24px;font-weight:400;line-height:32px;text-align:center;color:#000000;">{e.heading}</h1>
