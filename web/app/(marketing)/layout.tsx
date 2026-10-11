@@ -16,7 +16,6 @@ export default function MarketingLayout({ children }: { children: React.ReactNod
             <Link href="/#how">How it works</Link>
             <Link href="/#approvals">Approvals</Link>
             <Link href="/#integrations">Integrations</Link>
-            <Link href="/#pricing">Pricing</Link>
             <Link href="/#faq">FAQ</Link>
           </nav>
           <div className="lp-nav-auth"><NavAuth /></div>
@@ -35,8 +34,7 @@ export default function MarketingLayout({ children }: { children: React.ReactNod
               <Link href="/#how">How it works</Link>
               <Link href="/#integrations">Integrations</Link>
               <Link href="/#security">Security</Link>
-              <Link href="/#pricing">Pricing</Link>
-            </div>
+              </div>
             <div>
               <h3>Company</h3>
               <a href={REPO}>GitHub</a>

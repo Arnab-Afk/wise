@@ -60,34 +60,6 @@ const SECURITY = [
   { title: "Everything leaves a trail", body: "Every query, hypothesis, action and approval is recorded with who or what did it and why." },
 ];
 
-const PLANS = [
-  {
-    name: "Hobby",
-    price: "$0",
-    per: "forever",
-    blurb: "For side projects and trying it on staging.",
-    items: ["1 project", "All integrations", "Approvals in Slack, Discord and email", "Bring your own Anthropic key"],
-    cta: "Start free",
-  },
-  {
-    name: "Team",
-    price: "$299",
-    per: "per month",
-    blurb: "For teams with real on-call rotations.",
-    items: ["Unlimited projects", "Teams and on-call routing", "Fix-forward with Claude or Cursor", "Incident memory across projects", "Priority support"],
-    cta: "Start a 14-day trial",
-    featured: true,
-  },
-  {
-    name: "Enterprise",
-    price: "Custom",
-    per: "annual",
-    blurb: "For regulated environments and large fleets.",
-    items: ["Self-hosted in your cloud", "SSO and audit export", "Custom action policies", "Dedicated support"],
-    cta: "Talk to us",
-    href: "mailto:wise@arnabbhowmik.in?subject=Tracewise%20Enterprise",
-  },
-];
 
 const FAQ = [
   {
@@ -108,7 +80,7 @@ const FAQ = [
   },
   {
     q: "Does my code leave my infrastructure?",
-    a: "Only the parts your coding agent reads to write a fix, sent to the provider you chose. Enterprise plans can run Tracewise and the coding agent entirely inside your cloud.",
+    a: "Only the parts your coding agent reads to write a fix, sent to the provider you chose.",
   },
 ];
 
@@ -127,7 +99,7 @@ export default function Landing() {
               <Link href="/signup" className="lp-btn lp-btn-ink">Start free</Link>
               <Link href="#how" className="lp-btn lp-btn-line">See how it works</Link>
             </div>
-            <p className="lp-hero-note">Free for one project. Connect a service in about five minutes.</p>
+            <p className="lp-hero-note">Connect your first service in about five minutes.</p>
           </div>
           <Replay />
         </div>
@@ -257,25 +229,6 @@ export default function Landing() {
         </div>
       </section>
 
-      <section id="pricing" className="lp-section lp-band">
-        <div className="lp-wrap">
-          <h2 className="lp-h2">Pricing</h2>
-          <p className="lp-sub">Model usage is billed by your AI provider. We never mark it up.</p>
-          <div className="lp-plans">
-            {PLANS.map((p) => (
-              <div key={p.name} className={`lp-plan ${p.featured ? "is-featured" : ""}`}>
-                <h3>{p.name}</h3>
-                <p className="lp-plan-price"><span>{p.price}</span> {p.per}</p>
-                <p className="lp-plan-blurb">{p.blurb}</p>
-                <ul>{p.items.map((i) => <li key={i}>{i}</li>)}</ul>
-                {p.href
-                  ? <a href={p.href} className="lp-btn lp-btn-line">{p.cta}</a>
-                  : <Link href="/signup" className={`lp-btn ${p.featured ? "lp-btn-ink" : "lp-btn-line"}`}>{p.cta}</Link>}
-              </div>
-            ))}
-          </div>
-        </div>
-      </section>
 
       <section id="faq" className="lp-section">
         <div className="lp-wrap lp-faq-grid">

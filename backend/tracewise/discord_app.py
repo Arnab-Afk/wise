@@ -306,6 +306,8 @@ def verify(request: Request, body: bytes) -> None:
     from cryptography.exceptions import InvalidSignature
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
     sig, ts = request.headers.get("x-signature-ed25519", ""), request.headers.get("x-signature-timestamp", "")
+    if not PUBLIC_KEY:
+        log.warning("Discord interaction rejected: DISCORD_PUBLIC_KEY is not set on this server")
     try:
         Ed25519PublicKey.from_public_bytes(bytes.fromhex(PUBLIC_KEY)).verify(bytes.fromhex(sig), ts.encode() + body)
     except (InvalidSignature, ValueError):
