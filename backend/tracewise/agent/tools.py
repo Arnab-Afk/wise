@@ -314,6 +314,13 @@ def _run_action(ctx, kind: str, target: str, params: dict, fn) -> dict:
     if existing and existing["status"] == "done":
         return {**existing["result"], "note": "already applied (resumed run)"}
     _guard_action(ctx)
+    from .. import approvals
+    if approvals.policy(ctx["incident"]["project_id"]) == "approve" or (kind == "deploy_fix" and not config.AUTO_DEPLOY_FIXES):
+        a = approvals.wait(approvals.request(ctx["incident"], key, kind, target, params)["id"], ctx["heartbeat"])
+        if a["status"] != "approved":
+            raise ToolError(f"Not approved: {approvals.describe(a)} was {a['status']}"
+                            + (f" by {a['decided_by']}" if a["decided_by"] else "") + (f" ({a['note']})" if a["note"] else "")
+                            + ". Don't retry it; keep production safe another way or escalate with a handover.")
     db.query("INSERT INTO actions (incident_id, idempotency_key, kind, target, params, status)"
              " VALUES (%s, %s, %s, %s, %s, 'running') ON CONFLICT (idempotency_key) DO NOTHING",
              ctx["incident"]["id"], key, kind, target, db.jsonb(params))
@@ -395,9 +402,6 @@ def deploy_fix(ctx, job_id: int, reason: str):
         raise ToolError(f"Fix job {job_id} doesn't belong to this incident.")
     if job["status"] != "ready" or not job["tests_passed"]:
         raise ToolError("Only a fix whose tests passed can be deployed.")
-    if not config.AUTO_DEPLOY_FIXES:
-        return {"deployed": False, "branch": job["branch"],
-                "note": "Auto-deploy of fixes is off: the fix is waiting on its branch for review."}
 
     def go():
         # Fast-forward main so the next normal deploy doesn't bring the bug back.
@@ -406,7 +410,8 @@ def deploy_fix(ctx, job_id: int, reason: str):
         r = deployer("POST", "/deploy", {"service": job["service"], "ref": job["commit_sha"],
                                          "actor": "tracewise", "reason": reason})
         return {"service": job["service"], "now_running": short(r["sha"]), "merged_to_main": merged}
-    return _run_action(ctx, "deploy_fix", job["service"], {"job_id": job_id, "reason": reason}, go)
+    return _run_action(ctx, "deploy_fix", job["service"], {"job_id": job_id, "reason": reason,
+                                                            "commit": short(job["commit_sha"]), "branch": job["branch"]}, go)
 
 
 # ---------- verify ----------

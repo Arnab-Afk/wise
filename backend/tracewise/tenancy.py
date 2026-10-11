@@ -57,8 +57,8 @@ def ensure_demo(cur) -> int | None:
     cur.execute("INSERT INTO workspaces (name, slug) VALUES ('Shopfront demo', %s)"
                 " ON CONFLICT (slug) DO UPDATE SET name = workspaces.name RETURNING id", (DEMO_SLUG,))
     ws = cur.fetchone()["id"]
-    cur.execute("INSERT INTO projects (workspace_id, name, slug, description, deployer_url, repo_path)"
-                " VALUES (%s, 'Shopfront', 'shopfront', 'Seven-service demo store with a deployer', %s, %s)"
+    cur.execute("INSERT INTO projects (workspace_id, name, slug, description, deployer_url, repo_path, action_policy)"
+                " VALUES (%s, 'Shopfront', 'shopfront', 'Seven-service demo store with a deployer', %s, %s, 'auto')"
                 " RETURNING id", (ws, config.DEPLOYER_URL, config.SHOPFRONT_REPO))
     return cur.fetchone()["id"]
 
@@ -86,6 +86,12 @@ def migrate(conn) -> None:
     _rekey(cur, "sources", "u", ["kind", "name"], ["project_id", "kind", "name"], "sources_project_kind_name")
     _rekey(cur, "source_events", "u", ["source", "fingerprint"], ["project_id", "source", "fingerprint"],
            "source_events_project_fingerprint")
+    # Projects that existed before approvals act automatically, as they always did (once only:
+    # an admin may switch them to approval later).
+    cur.execute("SELECT 1 FROM schema_meta WHERE key = 'approval_backfill'")
+    if not cur.fetchone():
+        cur.execute("UPDATE projects SET action_policy = 'auto' WHERE created_at < now()")
+        cur.execute("INSERT INTO schema_meta (key, value) VALUES ('approval_backfill', 'done')")
     if demo and config.INGEST_KEY:  # the legacy key keeps working, now scoped to the demo project
         cur.execute("INSERT INTO project_keys (project_id, name, prefix, key_hash) VALUES (%s, %s, %s, %s)"
                     " ON CONFLICT (key_hash) DO NOTHING",

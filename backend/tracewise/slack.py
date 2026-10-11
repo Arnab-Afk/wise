@@ -35,8 +35,9 @@ SIGNING_SECRET = os.environ.get("SLACK_SIGNING_SECRET", "")
 API = os.environ.get("SLACK_API_BASE", "https://slack.com/api").rstrip("/")
 AUTHORIZE = os.environ.get("SLACK_AUTHORIZE_URL", "https://slack.com/oauth/v2/authorize")
 PUBLIC_URL = os.environ.get("TW_PUBLIC_URL", "http://localhost:19100").rstrip("/")
-SCOPES = "chat:write,chat:write.public,channels:read,groups:read,commands"
-EVENTS = ("opened", "action", "fix", "resolved", "escalated")
+# users:read.email lets an Approve click be tied to a Tracewise member by their Slack email.
+SCOPES = "chat:write,chat:write.public,channels:read,groups:read,commands,users:read,users:read.email"
+EVENTS = ("opened", "approval", "action", "fix", "resolved", "escalated")
 _STATE_KEY = (os.environ.get("TW_SECRET_KEY") or "tracewise-dev").encode()
 
 
@@ -299,7 +300,40 @@ def step_text(step: dict) -> str | None:
 
 
 EVENT_OF = {"action": "action", "fix": "fix", "verify": "action", "resolve": "resolved", "escalate": "escalated",
-            "detector": "opened"}
+            "detector": "opened", "approval": "approval", "approval_decision": "approval"}
+
+
+def approval_blocks(a: dict) -> list[dict]:
+    from .approvals import describe
+    p = a.get("params") or {}
+    head = {"pending": ":raised_hand: *Approval needed*", "approved": ":white_check_mark: *Approved*",
+            "rejected": ":no_entry: *Rejected*", "expired": ":hourglass: *Expired*"}[a["status"]]
+    text = f"{head}: {describe(a)}"
+    if p.get("reason"):
+        text += f"\n>{p['reason'][:1500]}"
+    if a["status"] != "pending":
+        text += f"\n_{(a.get('decided_by') or 'Nobody') + (' via ' + a['decided_via'] if a.get('decided_via') not in (None, 'system') else '')}"
+        text += (f": {a['note']}" if a.get("note") else "") + "_"
+    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text[:2900]}}]
+    if a["status"] == "pending":
+        blocks.append({"type": "actions", "elements": [
+            {"type": "button", "text": {"type": "plain_text", "text": "Approve"}, "style": "primary", "action_id": "approve",
+             "value": str(a["id"]), "confirm": {"title": {"type": "plain_text", "text": "Approve this action?"},
+                                                "text": {"type": "plain_text", "text": describe(a)[:290]},
+                                                "confirm": {"type": "plain_text", "text": "Approve"}, "deny": {"type": "plain_text", "text": "Cancel"}}},
+            {"type": "button", "text": {"type": "plain_text", "text": "Reject"}, "style": "danger", "action_id": "reject", "value": str(a["id"])},
+            {"type": "button", "text": {"type": "plain_text", "text": "Open timeline"}, "url": f"{WEB_URL}/incidents/{a['incident_id']}", "action_id": "open"},
+        ]})
+    return blocks
+
+
+def refresh_approval(approval_id: int) -> None:
+    a = db.one("SELECT * FROM approvals WHERE id = %s", approval_id)
+    inc = db.one("SELECT * FROM incidents WHERE id = %s", a["incident_id"]) if a else None
+    target = _project_route(inc) if inc else None
+    if a and a["slack_ts"] and target:
+        call(target[1], "chat.update", channel=a["slack_channel"], ts=a["slack_ts"], text="Approval: " + a["kind"],
+             blocks=approval_blocks(a))
 
 
 def _project_route(incident: dict) -> tuple[dict, str, str] | None:
@@ -339,6 +373,16 @@ def post_step(step: dict) -> None:
         thread = {"channel_id": r["channel"], "ts": r["ts"]}
         if step["kind"] == "detector" and not step["title"].startswith("Also affected"):
             return  # the root message is the "opened" post
+    if step["kind"] == "approval":
+        a = db.one("SELECT * FROM approvals WHERE id = %s", (step.get("data") or {}).get("approval_id"))
+        if a and "approval" in route["events"]:
+            r = call(token, "chat.postMessage", channel=thread["channel_id"], thread_ts=thread["ts"], reply_broadcast=True,
+                     text="Approval needed", blocks=approval_blocks(a), unfurl_links=False)
+            db.query("UPDATE approvals SET slack_channel = %s, slack_ts = %s WHERE id = %s", r["channel"], r["ts"], a["id"])
+        return
+    if step["kind"] == "approval_decision":
+        refresh_approval((step.get("data") or {}).get("approval_id"))
+        return
     text = step_text(step)
     if text and event in route["events"]:
         call(token, "chat.postMessage", channel=thread["channel_id"], thread_ts=thread["ts"], text=text[:3000],
@@ -359,7 +403,8 @@ def notifier_loop() -> None:
             steps = db.query(
                 "SELECT s.* FROM incident_steps s JOIN incidents i ON i.id = s.incident_id"
                 " JOIN slack_routes r ON r.project_id = i.project_id"
-                " WHERE s.id > %s AND s.kind IN ('detector', 'action', 'fix', 'verify', 'resolve', 'escalate')"
+                " WHERE s.id > %s AND s.kind IN ('detector', 'action', 'fix', 'verify', 'resolve', 'escalate',"
+                " 'approval', 'approval_decision')"
                 " AND NOT EXISTS (SELECT 1 FROM slack_posts p WHERE p.step_id = s.id) ORDER BY s.id LIMIT 50", cursor)
             for step in steps:
                 try:
@@ -394,6 +439,11 @@ async def interactions(request: Request):
     if not inst:
         return JSONResponse({"text": "This Slack workspace isn't connected to Tracewise."})
     for action in payload.get("actions", []):
+        if action.get("action_id") in ("approve", "reject"):
+            reply = _decide_from_slack(inst, payload, int(action["value"]), action["action_id"])
+            if reply:
+                return JSONResponse({"response_type": "ephemeral", "replace_original": False, "text": reply})
+            continue
         if action.get("action_id") != "ack":
             continue
         inc = db.one("SELECT i.* FROM incidents i JOIN projects p ON p.id = i.project_id"
@@ -406,6 +456,30 @@ async def interactions(request: Request):
             db.add_step(inc["id"], "note", f"Acknowledged by @{who} in Slack", {"text": f"Acknowledged by @{who} in Slack"})
         threading.Thread(target=lambda i=inc["id"]: _safe(refresh_root, i), daemon=True).start()
     return Response(status_code=200)
+
+
+def _decide_from_slack(inst: dict, payload: dict, approval_id: int, action_id: str) -> str | None:
+    """Only a Tracewise member (member or above) of this workspace may approve, matched by Slack email."""
+    from .approvals import decide, member_by_email
+    a = db.one("SELECT a.* FROM approvals a JOIN projects p ON p.id = a.project_id WHERE a.id = %s AND p.workspace_id = %s",
+               approval_id, inst["workspace_id"])
+    if not a:
+        return "That approval isn't in this workspace."
+    if a["status"] != "pending":
+        return f"Already {a['status']}" + (f" by {a['decided_by']}." if a["decided_by"] else ".")
+    slack_user = payload.get("user", {}).get("id")
+    try:
+        info = call(secrets.decrypt(bytes(inst["bot_token"])), "users.info", user=slack_user)
+        email = (info.get("user") or {}).get("profile", {}).get("email")
+    except SlackError:
+        email = None
+    person = member_by_email(inst["workspace_id"], email)
+    if not person:
+        return (f"Only Tracewise members can approve production actions. Your Slack email ({email or 'hidden'}) "
+                "isn't a member of this workspace with permission to act.")
+    decide(approval_id, "approved" if action_id == "approve" else "rejected", person.get("name") or person["email"], "slack")
+    threading.Thread(target=lambda: _safe(refresh_approval, approval_id), daemon=True).start()
+    return None
 
 
 def _safe(fn, *args):

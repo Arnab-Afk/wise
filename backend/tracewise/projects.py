@@ -27,7 +27,7 @@ def get_project(project_id: int, request: Request):
                    " (SELECT count(*) FROM incidents WHERE project_id = %s) AS incidents,"
                    " (SELECT count(*) FROM sources WHERE project_id = %s) AS sources", project_id, project_id, project_id)
     return {**{k: p[k] for k in ("id", "workspace_id", "name", "slug", "description", "created_at")},
-            "can_deploy": bool(p["deployer_url"]), "has_repo": bool(p["repo_path"]), **stats}
+            "can_deploy": bool(p["deployer_url"]), "has_repo": bool(p["repo_path"]), "action_policy": p["action_policy"], **stats}
 
 
 @router.patch("/{project_id}")

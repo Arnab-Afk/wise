@@ -11,7 +11,7 @@ import { Pill, Tag } from "@/components/tw/pills";
 import { Button } from "@/components/ui/button";
 import { KeyReveal } from "@/components/tw/key-reveal";
 
-interface Project { id: number; name: string; slug: string; description: string | null; can_deploy: boolean; has_repo: boolean;
+interface Project { id: number; name: string; slug: string; description: string | null; can_deploy: boolean; has_repo: boolean; action_policy: string;
   services: number; incidents: number; sources: number }
 interface Key { id: number; name: string; prefix: string; created_at: string; last_used_at: string | null; created_by: string | null }
 const input = "h-9 rounded-lg border px-3 outline-none focus:border-foreground/40";
@@ -68,6 +68,22 @@ export default function ProjectSettings() {
             <Pill tone="ok" dot>investigate telemetry</Pill>
             <Pill tone={project.can_deploy ? "ok" : "neutral"} dot>{project.can_deploy ? "roll back, restart, flags" : "no deploy integration: hands over instead"}</Pill>
             <Pill tone={project.has_repo ? "ok" : "neutral"} dot>{project.has_repo ? "read code, write fixes" : "no repository connected"}</Pill>
+          </div>
+        </Section>
+      )}
+
+      {project && (
+        <Section title="Production actions" description="Whether the agent may roll back, restart, flip flags and deploy fixes on its own.">
+          <div className="grid gap-2 p-4 sm:grid-cols-2">
+            {([["approve", "Ask a human first", "Each action waits for approval in Slack, the console or email (10 min). Unanswered means no."],
+               ["auto", "Act automatically", "The agent acts as soon as its evidence supports it, then verifies. Fastest recovery."]] as const).map(([value, label, hint]) => (
+              <button key={value} disabled={!admin} onClick={() => run("policy", () => api(`/v1/projects/${project.id}/policy`,
+                { method: "PATCH", body: JSON.stringify({ action_policy: value }) }), "Saved")}
+                className={`rounded-lg border px-3.5 py-3 text-left transition-colors hover:border-foreground/30 ${project.action_policy === value ? "border-foreground" : ""}`}>
+                <p className="font-medium">{label}</p>
+                <p className="mt-0.5 text-[12px] text-muted-foreground">{hint}</p>
+              </button>
+            ))}
           </div>
         </Section>
       )}

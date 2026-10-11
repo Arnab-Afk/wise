@@ -154,11 +154,13 @@ export function LiveActivity() {
     .then((rows) => setActive(rows.filter((r) => ACTIVE.includes(r.status)).length)).catch(() => {});
   usePoll(load, 10000);
   useStream((e) => { if (e.type === "incident_opened" || e.type === "step") load(); });
+  // Only shown while the agent is working an incident; nothing when all is well.
+  if (!active) return null;
   return (
     <Link href="/incidents" className="flex h-8 items-center gap-2.5 rounded-lg px-2.5 text-[13px] text-foreground/70 hover:bg-foreground/[0.05]">
-      <span className={cn("size-2 rounded-full", active ? "animate-pulse bg-bad" : "bg-ok")} />
-      {active ? "Agent working" : "All clear"}
-      {active ? <span className="num ml-auto rounded-md bg-bad-soft px-1.5 text-[11px] text-bad">{active}</span> : null}
+      <span className="size-2 animate-pulse rounded-full bg-bad" />
+      Agent working
+      <span className="num ml-auto rounded-md bg-bad-soft px-1.5 text-[11px] text-bad">{active}</span>
     </Link>
   );
 }

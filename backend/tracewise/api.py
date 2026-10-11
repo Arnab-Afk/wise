@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 
-from . import auth, config, connections, db, health, projects, slack, teams, tenancy, workspaces
+from . import approvals, auth, config, connections, db, discord_app, health, projects, slack, teams, tenancy, workspaces
 from .sources import receivers, router as sources_router
 
 
@@ -29,6 +29,8 @@ app.include_router(workspaces.router)
 app.include_router(projects.router)
 app.include_router(teams.router)
 app.include_router(slack.router)
+app.include_router(approvals.router)
+app.include_router(discord_app.router)
 app.include_router(connections.router)
 app.include_router(receivers.router)
 app.include_router(sources_router.router)
@@ -38,13 +40,14 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 # Anyone may call these: sign-in and invite previews.
 PUBLIC = ("/v1/auth/otp", "/v1/auth/oauth", "/v1/auth/providers", "/v1/auth/logout", "/v1/invites/preview",
           # Slack calls these directly; they check Slack's signature or the signed install state.
-          "/v1/slack/oauth/callback", "/v1/slack/interactions", "/v1/slack/commands")
+          "/v1/slack/oauth/callback", "/v1/slack/interactions", "/v1/slack/commands",
+          "/v1/discord/oauth/callback", "/v1/discord/interactions")
 # Telemetry in: needs a project ingest key, which also decides the project.
 INGEST = ("/v1/ingest",)
 # A signed-in user without a workspace (or project) may still use these.
 ACCOUNT = ("/v1/auth", "/v1/workspaces", "/v1/invites")
 # Workspace-level settings, not tied to one project.
-WORKSPACE_LEVEL = ACCOUNT + ("/v1/connections", "/v1/projects", "/v1/teams", "/v1/slack")
+WORKSPACE_LEVEL = ACCOUNT + ("/v1/connections", "/v1/projects", "/v1/teams", "/v1/slack", "/v1/discord")
 
 
 def deny(status: int, detail: str, code: str | None = None) -> JSONResponse:

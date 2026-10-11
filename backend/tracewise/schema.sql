@@ -465,3 +465,61 @@ CREATE TABLE IF NOT EXISTS slack_cursor (
 
 ALTER TABLE incidents ADD COLUMN IF NOT EXISTS acknowledged_by text;
 ALTER TABLE incidents ADD COLUMN IF NOT EXISTS acknowledged_at timestamptz;
+
+-- ---------- human approval for production actions ----------
+
+-- auto: the agent acts on its own. approve: every production action waits for a human.
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS action_policy text NOT NULL DEFAULT 'approve';
+
+CREATE TABLE IF NOT EXISTS approvals (
+    id            bigserial PRIMARY KEY,
+    incident_id   bigint NOT NULL REFERENCES incidents(id) ON DELETE CASCADE,
+    project_id    bigint NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    action_key    text NOT NULL UNIQUE,         -- the action's idempotency key: a resumed run reuses it
+    kind          text NOT NULL,                -- rollback | restart | set_flag | deploy_fix
+    target        text,
+    params        jsonb NOT NULL DEFAULT '{}',
+    status        text NOT NULL DEFAULT 'pending',  -- pending | approved | rejected | expired
+    requested_at  timestamptz NOT NULL DEFAULT now(),
+    expires_at    timestamptz NOT NULL,
+    decided_by    text,
+    decided_via   text,                         -- web | slack | email
+    note          text,
+    decided_at    timestamptz,
+    slack_channel text,
+    slack_ts      text,
+    discord_channel text,
+    discord_message text
+);
+CREATE INDEX IF NOT EXISTS approvals_incident ON approvals (incident_id);
+
+-- ---------- Discord app ----------
+
+CREATE TABLE IF NOT EXISTS discord_installations (
+    id           bigserial PRIMARY KEY,
+    workspace_id bigint NOT NULL UNIQUE REFERENCES workspaces(id) ON DELETE CASCADE,
+    guild_id     text NOT NULL,
+    guild_name   text,
+    installed_by bigint REFERENCES users(id) ON DELETE SET NULL,
+    created_at   timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS discord_installations_guild ON discord_installations (guild_id);
+
+CREATE TABLE IF NOT EXISTS discord_routes (
+    project_id   bigint PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+    channel_id   text NOT NULL,
+    channel_name text,
+    events       text[] NOT NULL DEFAULT '{opened,approval,action,fix,resolved,escalated}',
+    updated_at   timestamptz NOT NULL DEFAULT now()
+);
+
+-- The incident's message in the channel, and the thread under it.
+CREATE TABLE IF NOT EXISTS discord_threads (
+    incident_id bigint PRIMARY KEY REFERENCES incidents(id) ON DELETE CASCADE,
+    channel_id  text NOT NULL,
+    message_id  text NOT NULL,
+    thread_id   text,
+    created_at  timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS discord_posts (step_id bigint PRIMARY KEY, posted_at timestamptz NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS discord_cursor (id int PRIMARY KEY DEFAULT 1, step_id bigint NOT NULL);

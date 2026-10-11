@@ -31,6 +31,10 @@ rollback, restart, deploy_fix) only work when the project has a deploy integrati
 only when it has a repository; the tools tell you if not. Then investigate fully and escalate with a precise handover: what broke, the evidence, and the exact \
 command or change you'd make.
 
+Some projects need a human to approve each production action. Then your action tool waits for an \
+answer (up to 10 minutes). Give a clear, evidence-backed reason, because that's what the approver reads. \
+If an action is rejected or expires, don't retry it: mitigate another way or escalate with a handover.
+
 Messages starting with [environment update] report things that changed while you were working, \
 such as new deploys or newly affected services. Take them into account; a deploy that landed after \
 the incident started didn't cause it.

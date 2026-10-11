@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  ArrowLeft, Bell, BrainCircuit, Bug, Cable, ChartLine, ChevronRight, CircleCheck, Database, FileCode, FileDiff,
+  ArrowLeft, Bell, Hand, BrainCircuit, Bug, Cable, ChartLine, ChevronRight, CircleCheck, Database, FileCode, FileDiff,
   GitCommitHorizontal, HeartPulse, Lightbulb, Link2, ListChecks, MessageSquareText, Network, Pause, Play, Radio,
   RotateCcw, ScrollText, Search, ShieldCheck, SkipBack, SkipForward, Siren, TriangleAlert, UserRoundCog, Workflow,
   Wrench, Zap,
@@ -13,6 +13,7 @@ import { ACTIVE, api, type IncidentDetail, type Step } from "@/lib/api";
 import { clock, duration, stamp, tokens, usd } from "@/lib/format";
 import { useStream } from "@/hooks/use-stream";
 import { Hypotheses, StepBody } from "@/components/tw/step-body";
+import { ApprovalBanner } from "@/components/tw/approval-banner";
 import { Pill, Ring, SeverityBars, StatusPill, Tag } from "@/components/tw/pills";
 import { cn } from "@/lib/utils";
 
@@ -30,6 +31,7 @@ const KIND: Record<string, { icon: React.ComponentType<{ className?: string }>; 
   verify: { icon: ShieldCheck, tag: "verify" }, fix: { icon: Wrench, tag: "code fix" },
   environment: { icon: Radio, tag: "update" }, resolve: { icon: CircleCheck, tag: "resolved" },
   escalate: { icon: UserRoundCog, tag: "handover" }, error: { icon: TriangleAlert, tag: "error" },
+  approval: { icon: Hand, tag: "approval" }, approval_decision: { icon: Hand, tag: "decision" },
   tool: { icon: Search, tag: "tool" },
 };
 const SPEEDS = [1, 2, 4, 8, 16];
@@ -148,6 +150,7 @@ export function IncidentView({ id }: { id: string }) {
           <div className="mx-auto flex max-w-[780px] flex-col gap-5 px-6 py-7">
             {tab === "timeline" && (
               <>
+                <ApprovalBanner incidentId={incident.id} />
                 <AlertCard incident={incident} />
                 <section className="rounded-xl border">
                   <div className="flex items-center gap-2 border-b px-4 py-2.5">
@@ -253,9 +256,9 @@ function StepRow({ step, offset }: { step: Step; offset: number }) {
   }
   const meta = KIND[step.kind] ?? KIND.tool;
   const Icon = (step.kind === "tool" && TOOL_ICONS[step.data?.tool]) || meta.icon;
-  const expandable = !["resolve", "escalate"].includes(step.kind);
+  const expandable = !["resolve", "escalate", "approval", "approval_decision"].includes(step.kind);
   const failed = Boolean(step.data?.error);
-  const emphasis = step.kind === "action" || step.kind === "fix";
+  const emphasis = step.kind === "action" || step.kind === "fix" || step.kind === "approval";
   const [label, detail] = describe(step);
   return (
     <li className="relative">

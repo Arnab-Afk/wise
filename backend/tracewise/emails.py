@@ -295,6 +295,22 @@ def source_connected(to: str, workspace: str, kind: str, name: str, by: str | No
 
 # ---------------------------------------------------------------- incidents
 
+def approval_requested(to: str, incident: dict, action: str, reason: str, minutes: int) -> int:
+    url = f"{WEB_URL}/incidents/{incident['id']}"
+    return _send(to, "approval_requested", Email(
+        subject=f"Approve? {action} (incident #{incident['id']})",
+        preview=reason[:140],
+        heading=f"The agent wants to: {b(action)}",
+        paragraphs=[f"Incident #{incident['id']}: {escape(incident['title'])}",
+                    f"{b('Why:')} {escape(reason)}",
+                    f"Approve or reject it in Tracewise or Slack within {minutes} minutes. If nobody answers, the agent "
+                    "won't do it and will hand over instead."],
+        button=("Review and approve", url),
+        footer="You get approval requests because you're on call for this project.",
+        text=f"The agent wants to: {action}\nIncident #{incident['id']}: {incident['title']}\n\nWhy: {reason}\n\n"
+             f"Approve or reject within {minutes} minutes: {url}"))
+
+
 def incident_resolved(to: str, incident: dict, took: str, cost: str) -> int:
     url = f"{WEB_URL}/incidents/{incident['id']}"
     return _send(to, "incident_resolved", Email(
