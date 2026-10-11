@@ -74,7 +74,9 @@ def start(service: str, sha: str) -> None:
         "SHOPFRONT_PORTS": ",".join(f"{k}={v}" for k, v in port_map.items()),
     }
     procs[service] = subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", f"services.{service}.app:app", "--host", "127.0.0.1",
+        # Only the gateway is published outside the container; everything else stays internal.
+        [sys.executable, "-m", "uvicorn", f"services.{service}.app:app",
+         "--host", "0.0.0.0" if service == "gateway" else "127.0.0.1",
          "--port", str(port_map[service]), "--log-level", "warning", "--no-access-log"],
         cwd=tree, env=env,
     )
