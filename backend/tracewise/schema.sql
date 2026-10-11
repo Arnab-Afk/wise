@@ -419,3 +419,49 @@ CREATE TABLE IF NOT EXISTS team_projects (
     project_id bigint NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     PRIMARY KEY (team_id, project_id)
 );
+
+-- ---------- Slack app ----------
+
+-- One Slack workspace connected per Tracewise workspace. The bot token is encrypted.
+CREATE TABLE IF NOT EXISTS slack_installations (
+    id            bigserial PRIMARY KEY,
+    workspace_id  bigint NOT NULL UNIQUE REFERENCES workspaces(id) ON DELETE CASCADE,
+    team_id       text NOT NULL,
+    team_name     text,
+    bot_user_id   text,
+    bot_token     bytea NOT NULL,
+    scope         text,
+    installed_by  bigint REFERENCES users(id) ON DELETE SET NULL,
+    created_at    timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS slack_installations_team ON slack_installations (team_id);
+
+-- Which channel a project's incidents go to, and which events.
+CREATE TABLE IF NOT EXISTS slack_routes (
+    project_id   bigint PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+    channel_id   text NOT NULL,
+    channel_name text,
+    events       text[] NOT NULL DEFAULT '{opened,action,fix,resolved,escalated}',
+    updated_at   timestamptz NOT NULL DEFAULT now()
+);
+
+-- Each incident is one Slack thread: the root message is updated as its status changes.
+CREATE TABLE IF NOT EXISTS slack_threads (
+    incident_id bigint PRIMARY KEY REFERENCES incidents(id) ON DELETE CASCADE,
+    channel_id  text NOT NULL,
+    ts          text NOT NULL,
+    created_at  timestamptz NOT NULL DEFAULT now()
+);
+
+-- Timeline steps already posted (so a restart never double-posts), and where the poster got to.
+CREATE TABLE IF NOT EXISTS slack_posts (
+    step_id   bigint PRIMARY KEY,
+    posted_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS slack_cursor (
+    id      int PRIMARY KEY DEFAULT 1,
+    step_id bigint NOT NULL
+);
+
+ALTER TABLE incidents ADD COLUMN IF NOT EXISTS acknowledged_by text;
+ALTER TABLE incidents ADD COLUMN IF NOT EXISTS acknowledged_at timestamptz;

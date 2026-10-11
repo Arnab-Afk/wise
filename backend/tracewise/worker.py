@@ -53,6 +53,8 @@ def main() -> None:
     log.info("worker %s up (agent %s, neatlogs %s, model %s)", WORKER_ID,
              "on" if config.AGENT_ENABLED else "off", "on" if tracing.enabled else "off", config.MODEL)
     threading.Thread(target=detector_loop, daemon=True).start()
+    from . import slack
+    slack.start_notifier()
     running: dict[int, object] = {}
     with ThreadPoolExecutor(MAX_PARALLEL) as pool:
         while True:

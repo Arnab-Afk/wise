@@ -4,7 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { cn } from "@/lib/utils";
 
-const TABS = [["/settings/project", "Project"], ["/settings/workspace", "Workspace"], ["/settings/profile", "Profile"], ["/settings/emails", "Email log"]];
+const TABS = [["/settings/project", "Project"], ["/settings/workspace", "Workspace"], ["/settings/integrations", "Integrations"], ["/settings/profile", "Profile"], ["/settings/emails", "Email log"]];
 
 export function SettingsTabs() {
   const path = usePathname();
