@@ -27,18 +27,18 @@ export function InviteCard({ params }: { params: Promise<{ token: string }> }) {
     const data = await r.json();
     if (!r.ok) { setError(data.detail); setBusy(false); return; }
     try { localStorage.setItem("tw_workspace", String(data.workspace_id)); } catch {}
-    location.href = "/incidents";
+    window.location.assign("/overview");
   };
 
   const next = encodeURIComponent(`/invite/${token}`);
   return (
-    <div className="w-full max-w-[420px] rounded-2xl border bg-background p-8 text-center shadow-[0_1px_3px_rgba(0,0,0,0.04)]">
-      <span className="mx-auto flex size-10 items-center justify-center rounded-xl bg-muted"><Users className="size-5" /></span>
+    <div>
+      <span className="flex size-11 items-center justify-center rounded-xl border border-black/10 bg-white"><Users className="size-5" /></span>
       {!invite && !error && <Loader2 className="mx-auto mt-6 size-5 animate-spin text-muted-foreground" />}
       {invite && (
         <>
-          <h1 className="mt-4 text-[20px] font-medium tracking-tight">Join {invite.workspace}</h1>
-          <p className="mt-1.5 text-muted-foreground">
+          <h1 className="display mt-6 text-[44px] text-black">Join {invite.workspace}</h1>
+          <p className="mt-3 text-[15px] text-black/60">
             {invite.invited_by ?? "A teammate"} invited <span className="text-foreground">{invite.email}</span> as{" "}
             <span className="text-foreground">{invite.role}</span>.
           </p>
@@ -46,7 +46,7 @@ export function InviteCard({ params }: { params: Promise<{ token: string }> }) {
             <p className="mt-6 rounded-lg bg-muted px-3 py-2 text-[13px]">This invitation was {invite.state}. Ask for a new one.</p>
           ) : me === undefined ? null : me ? (
             me.email === invite.email ? (
-              <Button size="lg" className="mt-6 h-10 w-full" onClick={accept} disabled={busy}>
+              <Button size="lg" className="mt-8 h-11 w-full" onClick={accept} disabled={busy}>
                 {busy && <Loader2 className="animate-spin" />}Accept and join
               </Button>
             ) : (
@@ -56,8 +56,8 @@ export function InviteCard({ params }: { params: Promise<{ token: string }> }) {
               </div>
             )
           ) : (
-            <a href={`/login?next=${next}`} className="mt-6 flex h-10 items-center justify-center rounded-lg bg-foreground font-medium text-background">
-              Sign in as {invite.email} to accept
+            <a href={`/signup?next=${next}&email=${encodeURIComponent(invite.email)}`} className="mt-8 flex h-11 items-center justify-center rounded-lg bg-[#1c1b19] font-medium text-white">
+              Continue as {invite.email}
             </a>
           )}
         </>

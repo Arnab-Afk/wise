@@ -239,9 +239,8 @@ def notify_incident(incident_id: int, outcome: str, reason: str = "", handover: 
         inc = db.one("SELECT i.*, r.cost_usd FROM incidents i LEFT JOIN agent_runs r ON r.incident_id = i.id"
                      " WHERE i.id = %s", incident_id)
         wanted = ("all",) if outcome == "resolved" else ("all", "escalations")
-        people = db.query("SELECT DISTINCT u.email FROM users u JOIN workspace_members m ON m.user_id = u.id"
-                          " WHERE u.notify_incidents = ANY(%s) AND m.workspace_id ="
-                          " (SELECT workspace_id FROM projects WHERE id = %s)", list(wanted), inc["project_id"])
+        from ..teams import on_call
+        people = [u for u in on_call(inc["project_id"]) if u["notify_incidents"] in wanted]
         for p in people:
             if outcome == "resolved":
                 took = (inc["resolved_at"] - inc["opened_at"]).total_seconds()

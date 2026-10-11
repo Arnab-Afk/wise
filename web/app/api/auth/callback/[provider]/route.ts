@@ -20,7 +20,7 @@ export async function GET(request: Request, { params }: RouteContext<"/api/auth/
   });
   const data = await res.json();
   if (!res.ok) return fail(data.detail ?? "Sign-in failed.");
-  const next = saved.next?.startsWith("/") ? saved.next : data.has_workspace ? "/incidents" : "/onboarding";
+  const next = saved.next?.startsWith("/") ? saved.next : data.has_workspace ? "/overview" : "/onboarding";
   const out = NextResponse.redirect(new URL(next, origin));
   out.cookies.set(sessionCookie(request, data.token, data.expires_days));
   out.cookies.delete("tw_oauth");

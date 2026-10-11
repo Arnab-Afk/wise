@@ -253,13 +253,44 @@ def create_project(workspace_id: int, body: dict, request: Request):
     slug = slugify(name)
     if db.one("SELECT 1 FROM projects WHERE workspace_id = %s AND slug = %s", workspace_id, slug):
         raise HTTPException(409, "A project with that name already exists.")
-    row = db.one("INSERT INTO projects (workspace_id, name, slug, description, created_by)"
-                 " VALUES (%s, %s, %s, %s, %s) RETURNING *", workspace_id, name, slug,
-                 (body.get("description") or "").strip()[:300] or None, ctx["user"]["id"])
+    stack = [str(x)[:30] for x in (body.get("stack") or [])][:10]
+    row = db.one("INSERT INTO projects (workspace_id, name, slug, description, stack, created_by)"
+                 " VALUES (%s, %s, %s, %s, %s, %s) RETURNING *", workspace_id, name, slug,
+                 (body.get("description") or "").strip()[:300] or None, stack, ctx["user"]["id"])
+    if body.get("team_id"):
+        db.query("INSERT INTO team_projects (team_id, project_id) SELECT id, %s FROM teams WHERE id = %s"
+                 " AND workspace_id = %s ON CONFLICT DO NOTHING", row["id"], body["team_id"], workspace_id)
     ws = db.one("SELECT name FROM workspaces WHERE id = %s", workspace_id)
     for a in admins(workspace_id, exclude=ctx["user"]["id"]):
         emails.project_created(a["email"], ws["name"], name, display(ctx["user"]))
     return row
+
+
+@router.get("/workspaces/{workspace_id}/overview")
+def overview(workspace_id: int, request: Request):
+    """Everything in the workspace at a glance: each project's health and recent incidents."""
+    ctx = need(request, workspace_id, "viewer")
+    projects = db.query(
+        """SELECT p.id, p.name, p.slug, p.description, p.stack, p.created_at,
+                  p.deployer_url IS NOT NULL AS can_deploy, p.repo_path IS NOT NULL AS has_repo,
+                  (SELECT count(*) FROM services s WHERE s.project_id = p.id) AS services,
+                  (SELECT count(*) FROM sources s WHERE s.project_id = p.id) AS sources,
+                  (SELECT count(*) FROM incidents i WHERE i.project_id = p.id
+                     AND i.status IN ('open','investigating','acting','fixing','verifying')) AS open_incidents,
+                  (SELECT count(*) FROM incidents i WHERE i.project_id = p.id AND i.status = 'resolved'
+                     AND i.opened_at > now() - interval '30 days') AS resolved_30d,
+                  (SELECT max(opened_at) FROM incidents i WHERE i.project_id = p.id) AS last_incident_at,
+                  (SELECT max(last_seen) FROM services s WHERE s.project_id = p.id) AS last_data_at,
+                  (SELECT coalesce(array_agg(t.name ORDER BY t.name), '{}') FROM team_projects tp
+                     JOIN teams t ON t.id = tp.team_id WHERE tp.project_id = p.id) AS teams
+           FROM projects p WHERE p.workspace_id = %s ORDER BY p.created_at""", workspace_id)
+    counts = db.one("SELECT (SELECT count(*) FROM workspace_members WHERE workspace_id = %s) AS members,"
+                    " (SELECT count(*) FROM teams WHERE workspace_id = %s) AS teams,"
+                    " (SELECT count(*) FROM connections WHERE workspace_id = %s) AS coding_agents",
+                    workspace_id, workspace_id, workspace_id)
+    return {"workspace": db.one("SELECT id, name, slug, created_at FROM workspaces WHERE id = %s", workspace_id),
+            "role": ctx["role"], "projects": projects, **counts,
+            "open_incidents": sum(p["open_incidents"] for p in projects)}
 
 
 # ---------------------------------------------------------------- email log

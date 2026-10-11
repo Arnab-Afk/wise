@@ -195,7 +195,7 @@ def otp_verify(body: dict, request: Request):
         left = OTP_MAX_ATTEMPTS - row["attempts"] - 1
         raise HTTPException(400, f"That code isn't right. {left} {'try' if left == 1 else 'tries'} left.")
     db.query("UPDATE otp_codes SET consumed_at = now() WHERE id = %s", row["id"])
-    user, is_new = upsert_user(email)
+    user, is_new = upsert_user(email, (body.get("name") or "").strip()[:80] or None)
     return signed_in(user, is_new, "email", request)
 
 

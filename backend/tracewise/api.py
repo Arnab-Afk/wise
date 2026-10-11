@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 
-from . import auth, config, connections, db, health, projects, tenancy, workspaces
+from . import auth, config, connections, db, health, projects, teams, tenancy, workspaces
 from .sources import receivers, router as sources_router
 
 
@@ -27,6 +27,7 @@ app = FastAPI(title="Tracewise", lifespan=lifespan)
 app.include_router(auth.router)
 app.include_router(workspaces.router)
 app.include_router(projects.router)
+app.include_router(teams.router)
 app.include_router(connections.router)
 app.include_router(receivers.router)
 app.include_router(sources_router.router)
@@ -40,7 +41,7 @@ INGEST = ("/v1/ingest",)
 # A signed-in user without a workspace (or project) may still use these.
 ACCOUNT = ("/v1/auth", "/v1/workspaces", "/v1/invites")
 # Workspace-level settings, not tied to one project.
-WORKSPACE_LEVEL = ACCOUNT + ("/v1/connections", "/v1/projects")
+WORKSPACE_LEVEL = ACCOUNT + ("/v1/connections", "/v1/projects", "/v1/teams")
 
 
 def deny(status: int, detail: str, code: str | None = None) -> JSONResponse:

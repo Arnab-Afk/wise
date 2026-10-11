@@ -28,6 +28,17 @@ def enabled() -> bool:
     return bool(HOST and FROM)
 
 
+# Reserved test domains (RFC 2606) never get real mail; their messages are only logged.
+_NO_SEND = tuple(d.strip().lower() for d in os.environ.get("TW_MAIL_SKIP_DOMAINS", "").split(",") if d.strip()) \
+    + ("example.com", "example.org", "example.net")
+_NO_SEND_TLD = (".test", ".invalid", ".example", ".localhost")
+
+
+def deliverable(to: str) -> bool:
+    domain = to.rsplit("@", 1)[-1].lower()
+    return not (domain in _NO_SEND or domain.endswith(_NO_SEND_TLD) or any(domain.endswith("." + d) for d in _NO_SEND))
+
+
 def _deliver(email_id: int, to: str, subject: str, text: str, html: str) -> None:
     msg = EmailMessage()
     name, addr = parseaddr(FROM)
@@ -60,8 +71,8 @@ def send(to: str, template: str, message: dict) -> int:
         "INSERT INTO email_log (to_email, template, subject, text_body, html_body, status)"
         " VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
         to, template, message["subject"], message["text"], message["html"],
-        "queued" if enabled() else "skipped")
-    if enabled():
+        "queued" if enabled() and deliverable(to) else "skipped")
+    if enabled() and deliverable(to):
         _pool.submit(_deliver, row["id"], to, message["subject"], message["text"], message["html"])
     else:
         log.info("SMTP not configured; email %s (%s) to %s logged only", row["id"], template, to)

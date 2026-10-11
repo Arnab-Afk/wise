@@ -1,11 +1,14 @@
+import type { Metadata } from "next";
 import { Suspense } from "react";
+import { AuthShell } from "@/components/tw/auth-shell";
 import { LoginForm } from "./login-form";
 
+export const metadata: Metadata = { title: "Log in · Tracewise" };
+
 export default function LoginPage() {
-  // The form reads ?next and ?error, so it renders inside Suspense (Cache Components).
   return (
-    <Suspense fallback={<div className="h-[420px] w-full max-w-[400px] rounded-2xl border bg-background" />}>
-      <LoginForm />
-    </Suspense>
+    <AuthShell>
+      <Suspense><LoginForm mode="login" /></Suspense>
+    </AuthShell>
   );
 }

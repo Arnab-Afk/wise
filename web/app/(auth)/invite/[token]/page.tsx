@@ -1,10 +1,11 @@
 import { Suspense } from "react";
+import { AuthShell } from "@/components/tw/auth-shell";
 import { InviteCard } from "./invite-card";
 
 export default function InvitePage({ params }: PageProps<"/invite/[token]">) {
   return (
-    <Suspense fallback={<div className="h-[300px] w-full max-w-[420px] rounded-2xl border bg-background" />}>
-      <InviteCard params={params} />
-    </Suspense>
+    <AuthShell>
+      <Suspense><InviteCard params={params} /></Suspense>
+    </AuthShell>
   );
 }

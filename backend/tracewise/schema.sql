@@ -391,3 +391,31 @@ CREATE INDEX IF NOT EXISTS edge_points_project ON edge_points (project_id, ts DE
 CREATE INDEX IF NOT EXISTS deploys_project ON deploys (project_id, deployed_at DESC);
 CREATE INDEX IF NOT EXISTS incidents_project ON incidents (project_id, id DESC);
 CREATE INDEX IF NOT EXISTS source_events_project ON source_events (project_id, active_until DESC);
+
+-- ---------- teams: groups of members that own projects ----------
+
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS stack text[] NOT NULL DEFAULT '{}';  -- what it runs on
+
+CREATE TABLE IF NOT EXISTS teams (
+    id           bigserial PRIMARY KEY,
+    workspace_id bigint NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    name         text NOT NULL,
+    description  text,
+    created_by   bigint REFERENCES users(id) ON DELETE SET NULL,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (workspace_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS team_members (
+    team_id    bigint NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+    user_id    bigint NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (team_id, user_id)
+);
+
+-- Which team is on call for a project: its members get that project's incident emails.
+CREATE TABLE IF NOT EXISTS team_projects (
+    team_id    bigint NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+    project_id bigint NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    PRIMARY KEY (team_id, project_id)
+);

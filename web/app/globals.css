@@ -157,6 +157,13 @@
   .micro {
     @apply font-mono text-[10.5px] font-medium tracking-[0.08em] text-muted-foreground uppercase;
   }
+  /* Display serif for big headings, as in the iac console */
+  .display {
+    font-family: var(--font-instrument-serif), Georgia, serif;
+    font-weight: 400;
+    letter-spacing: -0.01em;
+    line-height: 1.05;
+  }
   .num {
     @apply font-mono tabular-nums;
   }

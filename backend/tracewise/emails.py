@@ -244,6 +244,17 @@ def removed_from_workspace(to: str, workspace: str, by: str | None) -> int:
         text=f"{by or 'An admin'} removed you from {workspace} on Tracewise. You no longer have access to it."))
 
 
+def added_to_team(to: str, workspace: str, team: str, projects: list[str], by: str | None) -> int:
+    owns = f" The team is on call for {', '.join(projects)}, so you'll get its incident emails." if projects else ""
+    return _send(to, "added_to_team", Email(
+        subject=f"You were added to {team} in {workspace}",
+        preview=f"{by or 'An admin'} added you to {team}.",
+        heading=f"You're on {b(team)}",
+        paragraphs=[f"{b(by or 'An admin')} added you to the {b(team)} team in {b(workspace)}.{escape(owns)}"],
+        button=("View your teams", f"{WEB_URL}/teams"),
+        text=f"{by or 'An admin'} added you to the {team} team in {workspace}.{owns}\n\n{WEB_URL}/teams"))
+
+
 def project_created(to: str, workspace: str, project: str, by: str | None) -> int:
     return _send(to, "project_created", Email(
         subject=f"New project in {workspace}: {project}",
