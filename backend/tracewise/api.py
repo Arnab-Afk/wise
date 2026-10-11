@@ -8,9 +8,11 @@ from datetime import datetime, timezone
 import psycopg
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 
-from . import config, connections, db, health
+from . import auth, config, connections, db, health, workspaces
 from .sources import receivers, router as sources_router
 
 
@@ -22,11 +24,40 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Tracewise", lifespan=lifespan)
+app.include_router(auth.router)
+app.include_router(workspaces.router)
 app.include_router(connections.router)
 app.include_router(receivers.router)
 app.include_router(sources_router.router)
 app.include_router(sources_router.agent_router)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# Routes anyone can call: telemetry ingest (guarded by the ingest key), sign-in, invite previews.
+PUBLIC = ("/v1/ingest", "/v1/auth/otp", "/v1/auth/oauth", "/v1/auth/providers", "/v1/auth/logout",
+          "/v1/invites/preview")
+# Routes a signed-in user without a workspace may use (to create or join one).
+NO_WORKSPACE_OK = ("/v1/auth", "/v1/workspaces", "/v1/invites")
+
+
+@app.middleware("http")
+async def require_sign_in(request, call_next):
+    path = request.url.path
+    if not path.startswith("/v1/") or path.startswith(PUBLIC) or request.method == "OPTIONS":
+        return await call_next(request)
+    # Scripts and internal tools (scenarios, the collector) use the ingest key.
+    if config.INGEST_KEY and request.headers.get("x-ingest-key") == config.INGEST_KEY:
+        return await call_next(request)
+    ctx = await run_in_threadpool(auth.resolve, request)
+    if not ctx:
+        return JSONResponse({"detail": "Sign in required.", "code": "unauthenticated"}, status_code=401)
+    if not ctx["workspace"] and not path.startswith(NO_WORKSPACE_OK):
+        return JSONResponse({"detail": "Create or join a workspace first.", "code": "no_workspace"}, status_code=403)
+    if request.method not in ("GET", "HEAD") and not path.startswith(NO_WORKSPACE_OK):
+        needed = "admin" if path.startswith(("/v1/connections", "/v1/sources")) else "member"
+        if auth.rank(ctx["role"]) < auth.rank(needed):
+            return JSONResponse({"detail": f"You need to be {needed} or above to do that."}, status_code=403)
+    request.state.auth = ctx
+    return await call_next(request)
 
 
 def check_key(key: str | None) -> None:

@@ -88,6 +88,21 @@ Details and how each one was verified are in [docs/CONNECTORS.md](docs/CONNECTOR
 OpenSearch, Fluent Bit, Vector and the OTel Collector) against a two-service app with a fault
 switch. Start it with `integrations/lab/up.sh`.
 
+## Accounts, workspaces and email
+
+- **Sign in** with a one-time email code, Google or GitHub (`/login`). Sessions are httpOnly
+  cookies in the web app; the API checks them on every `/v1` route except ingest.
+- **Workspaces** have owners, admins, members and viewers. Admins invite people by email,
+  manage roles and projects, and connect sources and coding agents.
+- **Email** for every account and team event: sign-in code, welcome, new-device sign-in, linked
+  Google/GitHub, workspace created, invitation, invitation accepted, joined, role changed, removed,
+  project created, coding agent connected/disconnected, source connected, and incident resolved or
+  escalated (by each person's notification setting). Templates follow the iac project's
+  Vercel-style layout; every email is logged and previewable under Settings → Email log.
+- Configure in `.env`: `SMTP_HOST/PORT/USERNAME/PASSWORD/FROM` (STARTTLS on 587 or TLS on 465),
+  `GOOGLE_CLIENT_ID/SECRET`, `GITHUB_CLIENT_ID/SECRET`, and `TW_WEB_URL`. OAuth callback URLs are
+  `<TW_WEB_URL>/api/auth/callback/google` and `/api/auth/callback/github`.
+
 ## Where neatlogs, Entire and cfo.ai fit
 
 | Tool | Role |

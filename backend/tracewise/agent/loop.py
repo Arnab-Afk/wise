@@ -9,7 +9,7 @@ import logging
 
 import anthropic
 
-from .. import config, db, tracing
+from .. import config, db, emails, tracing
 from . import prompt, tools
 
 log = logging.getLogger("tracewise.agent")
@@ -219,6 +219,7 @@ def finish_resolved(incident: dict, a: dict) -> None:
              a["root_cause"], a["fix"], f"Resolved and verified. Lesson: {a['lesson']}")
     db.add_step(incident["id"], "resolve", a["title"], a, phase="finish")
     db.query("UPDATE agent_runs SET finished_at = now() WHERE incident_id = %s", incident["id"])
+    notify_incident(incident["id"], "resolved")
 
 
 def finish_escalated(incident: dict, reason: str, handover: str) -> None:
@@ -227,6 +228,26 @@ def finish_escalated(incident: dict, reason: str, handover: str) -> None:
     db.add_step(incident["id"], "escalate", reason[:160], {"reason": reason, "handover": handover},
                 phase="finish")
     db.query("UPDATE agent_runs SET finished_at = now() WHERE incident_id = %s", incident["id"])
+    notify_incident(incident["id"], "escalated", reason, handover)
+
+
+def notify_incident(incident_id: int, outcome: str, reason: str = "", handover: str = "") -> None:
+    """Email workspace members whose notification setting covers this outcome."""
+    try:
+        inc = db.one("SELECT i.*, r.cost_usd FROM incidents i LEFT JOIN agent_runs r ON r.incident_id = i.id"
+                     " WHERE i.id = %s", incident_id)
+        wanted = ("all",) if outcome == "resolved" else ("all", "escalations")
+        people = db.query("SELECT DISTINCT u.email FROM users u JOIN workspace_members m ON m.user_id = u.id"
+                          " WHERE u.notify_incidents = ANY(%s)", list(wanted))
+        for p in people:
+            if outcome == "resolved":
+                took = (inc["resolved_at"] - inc["opened_at"]).total_seconds()
+                emails.incident_resolved(p["email"], inc, f"{int(took // 60)}m {int(took % 60):02d}s",
+                                         f"${float(inc['cost_usd'] or 0):.2f}")
+            else:
+                emails.incident_escalated(p["email"], inc, reason, handover)
+    except Exception:
+        log.exception("incident %s notification failed", incident_id)
 
 
 # ---------- main loop ----------

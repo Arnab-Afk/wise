@@ -27,9 +27,17 @@ EVIDENCE = ROOT / "docs" / "evidence" / "scenarios.md"
 BASELINE_TAG = "baseline"
 
 
+def ingest_key() -> str:
+    """The API needs a session or the ingest key; scripts use the key from .env."""
+    for line in (ROOT / ".env").read_text().splitlines():
+        if line.startswith("TW_INGEST_KEY="):
+            return line.split("=", 1)[1].strip()
+    return ""
+
+
 def http(method: str, url: str, body: dict | None = None):
     req = urllib.request.Request(url, method=method, data=json.dumps(body).encode() if body else None,
-                                 headers={"content-type": "application/json"})
+                                 headers={"content-type": "application/json", "x-ingest-key": ingest_key()})
     with urllib.request.urlopen(req, timeout=120) as resp:
         return json.loads(resp.read() or "null")
 

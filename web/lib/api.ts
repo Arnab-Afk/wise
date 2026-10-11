@@ -73,9 +73,20 @@ export interface ServiceHealth {
   error_logs?: number;
 }
 
+export function currentWorkspace(): string | null {
+  try { return localStorage.getItem("tw_workspace"); } catch { return null; }
+}
+
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
+  const ws = currentWorkspace();
   const res = await fetch(`${API}${path}`, { cache: "no-store", ...init,
-    headers: { "content-type": "application/json", ...init?.headers } });
+    headers: { "content-type": "application/json", ...(ws ? { "x-tracewise-workspace": ws } : {}), ...init?.headers } });
+  if (typeof window !== "undefined" && (res.status === 401 || res.status === 403)) {
+    const body = await res.clone().json().catch(() => ({}));
+    const here = location.pathname + location.search;
+    if (res.status === 401) location.href = `/login?next=${encodeURIComponent(here)}`;
+    else if (body.code === "no_workspace" && !location.pathname.startsWith("/onboarding")) location.href = "/onboarding";
+  }
   if (!res.ok) {
     let detail = res.statusText;
     try { detail = (await res.json()).detail ?? detail; } catch {}

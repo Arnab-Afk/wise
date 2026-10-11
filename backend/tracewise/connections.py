@@ -4,9 +4,9 @@ Claude is connected with an API key from the Claude Console, not a claude.ai log
 doesn't allow third-party products to offer claude.ai login or subscription limits.
 """
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 
-from . import db, secrets
+from . import db, emails, secrets
 
 PROVIDERS = {
     "claude": {"name": "Claude Agent", "credential": "Anthropic API key (Claude Console)",
@@ -31,8 +31,17 @@ def list_connections():
     return db.query(f"SELECT {PUBLIC} FROM connections ORDER BY is_default DESC, id")
 
 
+def _tell_admins(request: Request, provider: str, label: str, connected: bool) -> None:
+    from .workspaces import admins, display
+    ctx = getattr(request.state, "auth", None)
+    if not ctx or not ctx.get("workspace"):
+        return
+    for a in admins(ctx["workspace"]["id"]):
+        emails.coding_agent_changed(a["email"], ctx["workspace"]["name"], provider, label, connected, display(ctx["user"]))
+
+
 @router.post("/connections")
-def create_connection(body: dict):
+def create_connection(body: dict, request: Request):
     provider, key = body.get("provider"), (body.get("api_key") or "").strip()
     if provider not in PROVIDERS:
         raise HTTPException(400, f"provider must be one of {sorted(PROVIDERS)}")
@@ -47,6 +56,7 @@ def create_connection(body: dict):
         bool(body.get("is_default")) or first)
     if row["is_default"]:
         db.query("UPDATE connections SET is_default = false WHERE id <> %s", row["id"])
+    _tell_admins(request, provider, row["label"], True)
     return row
 
 
@@ -69,8 +79,10 @@ def make_default(connection_id: int):
 
 
 @router.delete("/connections/{connection_id}")
-def delete_connection(connection_id: int):
-    db.query("DELETE FROM connections WHERE id = %s", connection_id)
+def delete_connection(connection_id: int, request: Request):
+    row = db.one("DELETE FROM connections WHERE id = %s RETURNING provider, label", connection_id)
+    if row:
+        _tell_admins(request, row["provider"], row["label"], False)
     return {"deleted": True}
 
 

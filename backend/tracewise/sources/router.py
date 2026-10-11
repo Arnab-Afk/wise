@@ -58,7 +58,7 @@ def split_fields(kind: str, body: dict) -> tuple[dict, dict]:
 
 
 @router.post("/sources")
-def create_source(body: dict):
+def create_source(body: dict, request: Request):
     kind = body.get("kind")
     if kind not in KINDS:
         raise HTTPException(400, f"kind must be one of {sorted(KINDS)}")
@@ -69,10 +69,17 @@ def create_source(body: dict):
         raise HTTPException(400, f"missing: {', '.join(missing)}")
     name = body.get("name") or kind
     try:
-        return db.one(
+        row = db.one(
             f"INSERT INTO sources (kind, name, mode, config, credential, secret_fields, status)"
             f" VALUES (%s, %s, 'pull', %s, %s, %s, 'testing') RETURNING {PUBLIC}",
             kind, name, db.jsonb(cfg), secrets.encrypt(json.dumps(sec)) if sec else None, sorted(sec))
+        ctx = getattr(request.state, "auth", None)
+        if ctx and ctx.get("workspace"):
+            from .. import emails
+            from ..workspaces import admins, display
+            for a in admins(ctx["workspace"]["id"]):
+                emails.source_connected(a["email"], ctx["workspace"]["name"], KINDS[kind].label, name, display(ctx["user"]))
+        return row
     except Exception as exc:
         if "unique" in str(exc).lower():
             raise HTTPException(409, f"a {kind} source named {name!r} already exists")

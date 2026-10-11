@@ -247,3 +247,107 @@ CREATE INDEX IF NOT EXISTS source_events_active ON source_events (active_until D
 -- The incident an alert was already part of. An alert that keeps firing after its incident was
 -- closed doesn't open another one; it has to resolve and fire again.
 ALTER TABLE source_events ADD COLUMN IF NOT EXISTS incident_id bigint;
+
+-- ---------- accounts, workspaces and email ----------
+
+CREATE TABLE IF NOT EXISTS users (
+    id               bigserial PRIMARY KEY,
+    email            text NOT NULL UNIQUE,
+    name             text,
+    avatar_url       text,
+    notify_incidents text NOT NULL DEFAULT 'escalations',  -- all | escalations | none
+    created_at       timestamptz NOT NULL DEFAULT now(),
+    last_login_at    timestamptz
+);
+
+-- Google / GitHub accounts linked to a user.
+CREATE TABLE IF NOT EXISTS auth_identities (
+    provider         text NOT NULL,
+    provider_user_id text NOT NULL,
+    user_id          bigint NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    email            text,
+    created_at       timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (provider, provider_user_id)
+);
+
+-- One-time sign-in codes. Only a hash is stored.
+CREATE TABLE IF NOT EXISTS otp_codes (
+    id          bigserial PRIMARY KEY,
+    email       text NOT NULL,
+    code_hash   text NOT NULL,
+    attempts    int NOT NULL DEFAULT 0,
+    ip          text,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    expires_at  timestamptz NOT NULL,
+    consumed_at timestamptz
+);
+CREATE INDEX IF NOT EXISTS otp_codes_email ON otp_codes (email, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    id           bigserial PRIMARY KEY,
+    token_hash   text NOT NULL UNIQUE,
+    user_id      bigint NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    method       text NOT NULL,          -- email | google | github
+    ip           text,
+    user_agent   text,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    last_seen_at timestamptz NOT NULL DEFAULT now(),
+    expires_at   timestamptz NOT NULL,
+    revoked_at   timestamptz
+);
+
+CREATE TABLE IF NOT EXISTS workspaces (
+    id          bigserial PRIMARY KEY,
+    name        text NOT NULL,
+    slug        text NOT NULL UNIQUE,
+    created_by  bigint REFERENCES users(id) ON DELETE SET NULL,
+    created_at  timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS workspace_members (
+    workspace_id bigint NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    user_id      bigint NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role         text NOT NULL,          -- owner | admin | member | viewer
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (workspace_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS invites (
+    id           bigserial PRIMARY KEY,
+    workspace_id bigint NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    email        text NOT NULL,
+    role         text NOT NULL,
+    token_hash   text NOT NULL UNIQUE,
+    invited_by   bigint REFERENCES users(id) ON DELETE SET NULL,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    expires_at   timestamptz NOT NULL,
+    accepted_at  timestamptz,
+    revoked_at   timestamptz
+);
+
+-- A system the agent looks after (Shopfront is the first one).
+CREATE TABLE IF NOT EXISTS projects (
+    id           bigserial PRIMARY KEY,
+    workspace_id bigint NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    name         text NOT NULL,
+    slug         text NOT NULL,
+    description  text,
+    created_by   bigint REFERENCES users(id) ON DELETE SET NULL,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (workspace_id, slug)
+);
+
+-- Every email Tracewise sends (or would send without SMTP), rendered, for audit and preview.
+CREATE TABLE IF NOT EXISTS email_log (
+    id          bigserial PRIMARY KEY,
+    to_email    text NOT NULL,
+    template    text NOT NULL,
+    subject     text NOT NULL,
+    text_body   text NOT NULL,
+    html_body   text NOT NULL,
+    status      text NOT NULL,           -- queued | sent | failed | skipped
+    error       text,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    sent_at     timestamptz
+);
+CREATE INDEX IF NOT EXISTS email_log_created ON email_log (created_at DESC);
