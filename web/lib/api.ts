@@ -77,15 +77,37 @@ export function currentWorkspace(): string | null {
   try { return localStorage.getItem("tw_workspace"); } catch { return null; }
 }
 
+export function currentProject(): string | null {
+  try { return localStorage.getItem("tw_project"); } catch { return null; }
+}
+
+/** Switch workspace and/or project; everything on screen belongs to the new one, so reload. */
+export function switchTo(workspace: number | null, project: number | null) {
+  try {
+    if (workspace) localStorage.setItem("tw_workspace", String(workspace));
+    if (project) localStorage.setItem("tw_project", String(project)); else localStorage.removeItem("tw_project");
+  } catch {}
+  window.location.assign("/incidents");
+}
+
+export function scopeQuery(): string {
+  const q = new URLSearchParams();
+  const ws = currentWorkspace(), p = currentProject();
+  if (ws) q.set("workspace", ws);
+  if (p) q.set("project", p);
+  return q.toString();
+}
+
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const ws = currentWorkspace();
+  const ws = currentWorkspace(), project = currentProject();
   const res = await fetch(`${API}${path}`, { cache: "no-store", ...init,
-    headers: { "content-type": "application/json", ...(ws ? { "x-tracewise-workspace": ws } : {}), ...init?.headers } });
+    headers: { "content-type": "application/json", ...(ws ? { "x-tracewise-workspace": ws } : {}),
+      ...(project ? { "x-tracewise-project": project } : {}), ...init?.headers } });
   if (typeof window !== "undefined" && (res.status === 401 || res.status === 403)) {
     const body = await res.clone().json().catch(() => ({}));
     const here = location.pathname + location.search;
     if (res.status === 401) location.href = `/login?next=${encodeURIComponent(here)}`;
-    else if (body.code === "no_workspace" && !location.pathname.startsWith("/onboarding")) location.href = "/onboarding";
+    else if ((body.code === "no_workspace" || body.code === "no_project") && !location.pathname.startsWith("/onboarding")) location.href = "/onboarding";
   }
   if (!res.ok) {
     let detail = res.statusText;

@@ -6,13 +6,13 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 import psycopg
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 
-from . import auth, config, connections, db, health, workspaces
+from . import auth, config, connections, db, health, projects, tenancy, workspaces
 from .sources import receivers, router as sources_router
 
 
@@ -26,43 +26,60 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="Tracewise", lifespan=lifespan)
 app.include_router(auth.router)
 app.include_router(workspaces.router)
+app.include_router(projects.router)
 app.include_router(connections.router)
 app.include_router(receivers.router)
 app.include_router(sources_router.router)
 app.include_router(sources_router.agent_router)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# Routes anyone can call: telemetry ingest (guarded by the ingest key), sign-in, invite previews.
-PUBLIC = ("/v1/ingest", "/v1/auth/otp", "/v1/auth/oauth", "/v1/auth/providers", "/v1/auth/logout",
-          "/v1/invites/preview")
-# Routes a signed-in user without a workspace may use (to create or join one).
-NO_WORKSPACE_OK = ("/v1/auth", "/v1/workspaces", "/v1/invites")
+# Anyone may call these: sign-in and invite previews.
+PUBLIC = ("/v1/auth/otp", "/v1/auth/oauth", "/v1/auth/providers", "/v1/auth/logout", "/v1/invites/preview")
+# Telemetry in: needs a project ingest key, which also decides the project.
+INGEST = ("/v1/ingest",)
+# A signed-in user without a workspace (or project) may still use these.
+ACCOUNT = ("/v1/auth", "/v1/workspaces", "/v1/invites")
+# Workspace-level settings, not tied to one project.
+WORKSPACE_LEVEL = ACCOUNT + ("/v1/connections", "/v1/projects")
+
+
+def deny(status: int, detail: str, code: str | None = None) -> JSONResponse:
+    return JSONResponse({"detail": detail, **({"code": code} if code else {})}, status_code=status)
 
 
 @app.middleware("http")
-async def require_sign_in(request, call_next):
+async def access(request, call_next):
+    """Who is calling, which workspace and project they act in, and whether they may."""
     path = request.url.path
     if not path.startswith("/v1/") or path.startswith(PUBLIC) or request.method == "OPTIONS":
         return await call_next(request)
-    # Scripts and internal tools (scenarios, the collector) use the ingest key.
-    if config.INGEST_KEY and request.headers.get("x-ingest-key") == config.INGEST_KEY:
+    if path.startswith(INGEST):
+        ctx = await run_in_threadpool(auth.service_context, request)
+        if not ctx:
+            return deny(401, "Invalid or missing ingest key.")
+        request.state.auth = ctx
         return await call_next(request)
     ctx = await run_in_threadpool(auth.resolve, request)
     if not ctx:
-        return JSONResponse({"detail": "Sign in required.", "code": "unauthenticated"}, status_code=401)
-    if not ctx["workspace"] and not path.startswith(NO_WORKSPACE_OK):
-        return JSONResponse({"detail": "Create or join a workspace first.", "code": "no_workspace"}, status_code=403)
-    if request.method not in ("GET", "HEAD") and not path.startswith(NO_WORKSPACE_OK):
-        needed = "admin" if path.startswith(("/v1/connections", "/v1/sources")) else "member"
+        ctx = await run_in_threadpool(auth.service_context, request)
+        if ctx and path.startswith(WORKSPACE_LEVEL):
+            return deny(403, "Ingest keys can't manage accounts, workspaces or coding agents.")
+    if not ctx:
+        return deny(401, "Sign in required.", "unauthenticated")
+    if not ctx["workspace"] and not path.startswith(ACCOUNT):
+        return deny(403, "Create or join a workspace first.", "no_workspace")
+    if not ctx.get("project") and not path.startswith(WORKSPACE_LEVEL):
+        return deny(403, "Create a project first.", "no_project")
+    if request.method not in ("GET", "HEAD") and not path.startswith(ACCOUNT):
+        needed = "admin" if path.startswith(("/v1/connections", "/v1/sources", "/v1/projects")) else "member"
         if auth.rank(ctx["role"]) < auth.rank(needed):
-            return JSONResponse({"detail": f"You need to be {needed} or above to do that."}, status_code=403)
+            return deny(403, f"You need to be {needed} or above to do that.")
     request.state.auth = ctx
     return await call_next(request)
 
 
-def check_key(key: str | None) -> None:
-    if config.INGEST_KEY and key != config.INGEST_KEY:
-        raise HTTPException(401, "invalid ingest key")
+def pid(request: Request) -> int:
+    return request.state.auth["project"]["id"]
 
 
 def ts(value: float) -> datetime:
@@ -76,115 +93,108 @@ def healthz():
 
 
 @app.post("/v1/ingest/telemetry")
-def ingest_telemetry(body: dict, x_ingest_key: str | None = Header(None)):
-    check_key(x_ingest_key)
+def ingest_telemetry(body: dict, request: Request):
+    """Native telemetry (request metrics, error logs and calls to other services) from one service."""
+    from .sources.model import store
     service, at = body["service"], ts(body["ts"])
-    db.query(
-        "INSERT INTO services (name, current_sha) VALUES (%s, %s)"
-        " ON CONFLICT (name) DO UPDATE SET current_sha = EXCLUDED.current_sha, last_seen = now()",
-        service, body.get("sha"))
-    db.query(
-        "INSERT INTO metric_points (service, ts, sha, count, errors, p50_ms, p95_ms, max_ms)"
-        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-        service, at, body.get("sha"), body["count"], body["errors"], body["p50_ms"],
-        body["p95_ms"], body["max_ms"])
-    for edge in body.get("edges", []):
-        db.query(
-            "INSERT INTO service_edges (src, dst, calls, errors) VALUES (%s, %s, %s, %s)"
-            " ON CONFLICT (src, dst) DO UPDATE SET calls = service_edges.calls + EXCLUDED.calls,"
-            " errors = service_edges.errors + EXCLUDED.errors, last_seen = now()",
-            service, edge["to"], edge["calls"], edge["errors"])
-        db.query(
-            "INSERT INTO edge_points (src, dst, ts, calls, errors, avg_ms) VALUES (%s, %s, %s, %s, %s, %s)",
-            service, edge["to"], at, edge["calls"], edge["errors"],
-            edge["latency_ms"] / max(edge["calls"], 1))
-    for entry in body.get("logs", []):
-        extra = {k: v for k, v in entry.items()
-                 if k not in ("ts", "level", "message", "route", "status", "trace")}
-        db.query(
-            "INSERT INTO log_events (service, ts, sha, level, message, route, status, trace, fields)"
-            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
-            service, ts(entry["ts"]), body.get("sha"), entry["level"], entry["message"],
-            entry.get("route"), entry.get("status"), entry.get("trace"), db.jsonb(extra))
+    edges = [{"src": service, "dst": e["to"], "calls": e["calls"], "errors": e["errors"],
+              "avg_ms": e["latency_ms"] / max(e["calls"], 1), "ts": at} for e in body.get("edges", [])]
+    logs = [{"service": service, "ts": ts(e["ts"]), "sha": body.get("sha"), "level": e["level"],
+             "message": e["message"], "route": e.get("route"), "status": e.get("status"), "trace": e.get("trace"),
+             "fields": {k: v for k, v in e.items() if k not in ("ts", "level", "message", "route", "status", "trace")}}
+            for e in body.get("logs", [])]
+    metric = {"service": service, "ts": at, "sha": body.get("sha"), "count": body["count"],
+              "errors": body["errors"], "p50_ms": body["p50_ms"], "p95_ms": body["p95_ms"], "max_ms": body["max_ms"]}
+    store(None, pid(request), metrics=[metric], edges=edges, logs=logs)
     return {"ok": True}
 
 
 @app.post("/v1/ingest/deploys")
-def ingest_deploy(body: dict, x_ingest_key: str | None = Header(None)):
-    check_key(x_ingest_key)
-    row = db.one(
-        "INSERT INTO deploys (service, sha, prev_sha, author, author_email, message, committed_at,"
-        " actor, reason, deployed_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
-        body["service"], body["sha"], body.get("prev_sha"), body.get("author"),
-        body.get("author_email"), body.get("message"), body.get("committed_at"), body.get("actor"),
-        body.get("reason"), ts(body["deployed_at"]))
-    db.notify("system_events", {"type": "deploy", "deploy_id": row["id"], **body})
-    return {"id": row["id"]}
+def ingest_deploy(body: dict, request: Request):
+    from .sources.model import store
+    store(body.get("actor"), pid(request), deploys=[{**body, "deployed_at": ts(body["deployed_at"])}])
+    return {"ok": True}
 
 
 @app.get("/v1/health")
-def service_health():
-    return health.snapshot()
+def service_health(request: Request):
+    return health.snapshot(pid(request))
 
 
 @app.get("/v1/topology")
-def topology():
-    edges = db.query("SELECT src, dst, calls, errors, last_seen FROM service_edges ORDER BY src, dst")
-    services = db.query("SELECT name, current_sha, last_seen FROM services ORDER BY name")
+def topology(request: Request):
+    p = pid(request)
+    edges = db.query("SELECT src, dst, calls, errors, last_seen FROM service_edges WHERE project_id = %s"
+                     " ORDER BY src, dst", p)
+    services = db.query("SELECT name, current_sha, last_seen FROM services WHERE project_id = %s ORDER BY name", p)
     return {"services": services, "edges": edges}
 
 
 @app.get("/v1/deploys")
-def list_deploys(limit: int = 50):
-    return db.query("SELECT * FROM deploys ORDER BY deployed_at DESC LIMIT %s", limit)
+def list_deploys(request: Request, limit: int = 50):
+    return db.query("SELECT * FROM deploys WHERE project_id = %s ORDER BY deployed_at DESC LIMIT %s",
+                    pid(request), min(limit, 500))
 
 
 @app.get("/v1/incidents")
-def list_incidents(limit: int = 50):
+def list_incidents(request: Request, limit: int = 50):
     return db.query(
         "SELECT i.*, r.turns, r.cost_usd, r.input_tokens, r.output_tokens FROM incidents i"
-        " LEFT JOIN agent_runs r ON r.incident_id = i.id ORDER BY i.id DESC LIMIT %s", limit)
+        " LEFT JOIN agent_runs r ON r.incident_id = i.id WHERE i.project_id = %s ORDER BY i.id DESC LIMIT %s",
+        pid(request), min(limit, 500))
 
 
 @app.get("/v1/incidents/{incident_id}")
-def get_incident(incident_id: int):
+def get_incident(incident_id: int, request: Request):
     incident = db.one(
         "SELECT i.*, r.turns, r.cost_usd, r.input_tokens, r.output_tokens FROM incidents i"
-        " LEFT JOIN agent_runs r ON r.incident_id = i.id WHERE i.id = %s", incident_id)
+        " LEFT JOIN agent_runs r ON r.incident_id = i.id WHERE i.id = %s AND i.project_id = %s",
+        incident_id, pid(request))
     if not incident:
         raise HTTPException(404, "incident not found")
-    incident["steps"] = db.query(
-        "SELECT * FROM incident_steps WHERE incident_id = %s ORDER BY id", incident_id)
-    incident["actions"] = db.query(
-        "SELECT * FROM actions WHERE incident_id = %s ORDER BY id", incident_id)
+    incident["steps"] = db.query("SELECT * FROM incident_steps WHERE incident_id = %s ORDER BY id", incident_id)
+    incident["actions"] = db.query("SELECT * FROM actions WHERE incident_id = %s ORDER BY id", incident_id)
     return incident
 
 
 @app.post("/v1/scenarios")
-def start_scenario(body: dict):
-    return db.one("INSERT INTO scenario_runs (name) VALUES (%s) RETURNING *", body["name"])
+def start_scenario(body: dict, request: Request):
+    return db.one("INSERT INTO scenario_runs (name, project_id) VALUES (%s, %s) RETURNING *", body["name"], pid(request))
 
 
 @app.patch("/v1/scenarios/{run_id}")
-def finish_scenario(run_id: int, body: dict):
-    return db.one("UPDATE scenario_runs SET ended_at = now(), result = %s WHERE id = %s RETURNING *",
-                  db.jsonb(body.get("result", {})), run_id)
+def finish_scenario(run_id: int, body: dict, request: Request):
+    return db.one("UPDATE scenario_runs SET ended_at = now(), result = %s WHERE id = %s AND project_id = %s"
+                  " RETURNING *", db.jsonb(body.get("result", {})), run_id, pid(request))
 
 
 @app.get("/v1/scenarios")
-def list_scenarios():
-    return db.query("SELECT * FROM scenario_runs ORDER BY id DESC LIMIT 100")
+def list_scenarios(request: Request):
+    return db.query("SELECT * FROM scenario_runs WHERE project_id = %s ORDER BY id DESC LIMIT 100", pid(request))
 
 
 @app.get("/v1/memories")
-def list_memories():
+def list_memories(request: Request):
     return db.query("SELECT id, incident_id, services, symptoms, root_cause, fix, outcome, created_at"
-                    " FROM memories ORDER BY id DESC")
+                    " FROM memories WHERE project_id = %s ORDER BY id DESC", pid(request))
+
+
+def _project_of(payload: dict) -> int | None:
+    if "project_id" in payload:
+        return payload["project_id"]
+    if payload.get("incident_id"):
+        row = db.one("SELECT project_id FROM incidents WHERE id = %s", payload["incident_id"])
+        return row and row["project_id"]
+    if payload.get("job_id"):
+        row = db.one("SELECT project_id FROM fix_jobs WHERE id = %s", payload["job_id"])
+        return row and row["project_id"]
+    return None
 
 
 @app.get("/v1/stream")
-async def stream():
-    """Server-sent events: new timeline steps and deploys, as they happen."""
+async def stream(request: Request):
+    """Server-sent events for this project: new timeline steps, incidents, deploys and alerts."""
+    project = pid(request)
 
     async def events():
         conn = await psycopg.AsyncConnection.connect(config.DATABASE_URL, autocommit=True)
@@ -200,9 +210,11 @@ async def stream():
                     yield ": keepalive\n\n"
                     continue
                 payload = json.loads(note.payload)
+                if await run_in_threadpool(_project_of, payload) != project:
+                    continue
                 if payload.get("type") == "step":
-                    payload["step"] = db.one("SELECT * FROM incident_steps WHERE id = %s",
-                                             payload["step_id"])
+                    payload["step"] = await run_in_threadpool(
+                        db.one, "SELECT * FROM incident_steps WHERE id = %s", payload["step_id"])
                 yield f"event: {payload['type']}\ndata: {json.dumps(payload, default=str)}\n\n"
         finally:
             await conn.close()

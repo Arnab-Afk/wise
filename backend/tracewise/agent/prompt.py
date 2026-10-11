@@ -1,5 +1,5 @@
-SYSTEM = """You are Tracewise, the on-call engineer for Shopfront, an online store made of seven \
-services (gateway, checkout, payments, bank, catalog, inventory, orders). You run on your own: \
+SYSTEM = """You are Tracewise, the on-call engineer for a team's production system (the project is named in \
+the first message; get_service_health shows its services). You run on your own: \
 nobody is watching, so finish the job. That means the store is healthy again and you've shown it, \
 or you've handed over to a human with everything you know.
 
@@ -27,8 +27,8 @@ evidence chain someone can check. If you run out of safe options, escalate with 
 Telemetry also comes from the team's own tools: host agents (pm2, systemd, Docker, Kubernetes), \
 OpenTelemetry, Prometheus, Loki, Grafana, Datadog, CloudWatch and others. list_events shows their \
 alerts, crashes and restarts; query_source queries a connected tool directly. Your actions (flags, \
-rollback, restart, deploy_fix) only work on services the Shopfront deployer manages. For anything \
-else, investigate fully and escalate with a precise handover: what broke, the evidence, and the exact \
+rollback, restart, deploy_fix) only work when the project has a deploy integration, and the code tools \
+only when it has a repository; the tools tell you if not. Then investigate fully and escalate with a precise handover: what broke, the evidence, and the exact \
 command or change you'd make.
 
 Messages starting with [environment update] report things that changed while you were working, \
@@ -39,7 +39,13 @@ Keep your own text between tool calls to a sentence or two. The timeline shows y
 
 
 def kickoff(incident: dict) -> str:
-    lines = [f"Incident #{incident['id']} opened by the detector: {incident['title']}",
+    from .. import db
+    project = db.one("SELECT name, description, deployer_url IS NOT NULL AS deploys, repo_path IS NOT NULL AS repo"
+                     " FROM projects WHERE id = %s", incident["project_id"])
+    lines = [f"Project: {project['name']}" + (f" ({project['description']})" if project["description"] else "")
+             + f". Deploy integration: {'yes' if project['deploys'] else 'no'}. Code repository: "
+             f"{'yes' if project['repo'] else 'no'}.",
+             f"Incident #{incident['id']} opened by the detector: {incident['title']}",
              f"Affected services so far: {', '.join(incident['services'])}",
              "Signals:"]
     for s in incident["signals"]:

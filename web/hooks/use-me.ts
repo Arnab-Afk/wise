@@ -7,6 +7,8 @@ export interface Me {
   id: number; email: string; name: string | null; avatar_url: string | null; notify_incidents: string;
   workspace: { id: number; name: string; slug: string; role: string } | null; role: string | null;
   workspaces: { id: number; name: string; slug: string; role: string }[]; linked: string[];
+  project: { id: number; name: string; slug: string } | null;
+  projects: { id: number; name: string; slug: string; description: string | null; can_deploy: boolean; has_repo: boolean }[];
 }
 
 let cache: Me | null = null;

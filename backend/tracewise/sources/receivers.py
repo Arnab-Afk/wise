@@ -31,7 +31,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
 
-from .. import config
+from .. import config, tenancy
 from . import alerts, otlp, protowire, syslog
 from .model import log_from_dict, register, service_name, store
 
@@ -65,9 +65,13 @@ def ingest_key(request: Request) -> str | None:
     return request.query_params.get("key") or request.query_params.get("api_key")
 
 
-def check(request: Request) -> None:
-    if config.INGEST_KEY and ingest_key(request) != config.INGEST_KEY:
+def check(request: Request, key: str | None = None) -> dict:
+    """The project this request's ingest key sends to; 401 without a valid key."""
+    project = tenancy.project_for_key(key or ingest_key(request))
+    if not project:
         raise HTTPException(401, "invalid ingest key")
+    request.state.project = project
+    return project
 
 
 def source_name(request: Request, kind: str) -> str:
@@ -128,8 +132,9 @@ def save(request: Request, kind: str, **records) -> dict:
     if "tracewise-agent" in request.headers.get("user-agent", ""):
         kind = "agent"  # the host agent's row in the sources list, named after the host
     name = source_name(request, kind)
-    source_id = register(kind, name)
-    return store(f"{kind}:{name}" if name != kind else kind, source_id=source_id, **records)
+    project_id = request.state.project["id"]
+    source_id = register(kind, name, project_id)
+    return store(f"{kind}:{name}" if name != kind else kind, project_id, source_id=source_id, **records)
 
 
 async def asave(request: Request, kind: str, **records) -> dict:
@@ -186,14 +191,14 @@ async def ingest_events(request: Request):
 @router.post("/v1/ingest/heartbeat")
 async def heartbeat(request: Request):
     """The host agent says it's alive and what it's watching."""
-    check(request)
+    project = check(request)
     body = json.loads(await raw_body(request) or b"{}")
     from .. import db
-    db.query("INSERT INTO sources (kind, name, mode, status, config, last_received_at)"
-             " VALUES ('agent', %s, 'push', 'receiving', %s, now())"
-             " ON CONFLICT (kind, name) DO UPDATE SET config = EXCLUDED.config,"
+    db.query("INSERT INTO sources (project_id, kind, name, mode, status, config, last_received_at)"
+             " VALUES (%s, 'agent', %s, 'push', 'receiving', %s, now())"
+             " ON CONFLICT (project_id, kind, name) DO UPDATE SET config = EXCLUDED.config,"
              " status = 'receiving', last_received_at = now()",
-             body.get("host", "unknown"), db.jsonb(body))
+             project["id"], body.get("host", "unknown"), db.jsonb(body))
     return {"ok": True}
 
 
@@ -398,10 +403,7 @@ async def hec_raw(request: Request):
 @router.post("/datadog/v1/input")
 @router.post("/datadog/v1/input/{key}")
 async def datadog_logs(request: Request, key: str | None = None):
-    if key and config.INGEST_KEY and key != config.INGEST_KEY:
-        raise HTTPException(403, "invalid key")
-    if not key:
-        check(request)
+    check(request, key)
     logs = []
     for r in parse_json_records(await raw_body(request)):
         if not isinstance(r, dict):

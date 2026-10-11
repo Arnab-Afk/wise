@@ -351,3 +351,43 @@ CREATE TABLE IF NOT EXISTS email_log (
     sent_at     timestamptz
 );
 CREATE INDEX IF NOT EXISTS email_log_created ON email_log (created_at DESC);
+
+-- ---------- multi-tenancy: every piece of telemetry and every incident belongs to a project ----------
+
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS deployer_url text;  -- set when Tracewise can deploy/roll back
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS repo_path text;     -- set when the code is checked out for the agent
+
+-- Keys that send telemetry into one project. Only a hash is stored; the key is shown once.
+CREATE TABLE IF NOT EXISTS project_keys (
+    id           bigserial PRIMARY KEY,
+    project_id   bigint NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    name         text NOT NULL,
+    prefix       text NOT NULL,          -- first characters, to tell keys apart
+    key_hash     text NOT NULL UNIQUE,
+    created_by   bigint REFERENCES users(id) ON DELETE SET NULL,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    last_used_at timestamptz,
+    revoked_at   timestamptz
+);
+
+ALTER TABLE services       ADD COLUMN IF NOT EXISTS project_id bigint REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE service_edges  ADD COLUMN IF NOT EXISTS project_id bigint REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE metric_points  ADD COLUMN IF NOT EXISTS project_id bigint REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE edge_points    ADD COLUMN IF NOT EXISTS project_id bigint REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE log_events     ADD COLUMN IF NOT EXISTS project_id bigint REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE deploys        ADD COLUMN IF NOT EXISTS project_id bigint REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE incidents      ADD COLUMN IF NOT EXISTS project_id bigint REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE memories       ADD COLUMN IF NOT EXISTS project_id bigint REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE scenario_runs  ADD COLUMN IF NOT EXISTS project_id bigint REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE fix_jobs       ADD COLUMN IF NOT EXISTS project_id bigint REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE sources        ADD COLUMN IF NOT EXISTS project_id bigint REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE source_events  ADD COLUMN IF NOT EXISTS project_id bigint REFERENCES projects(id) ON DELETE CASCADE;
+-- Coding-agent accounts belong to the team (workspace), shared by its projects.
+ALTER TABLE connections    ADD COLUMN IF NOT EXISTS workspace_id bigint REFERENCES workspaces(id) ON DELETE CASCADE;
+
+CREATE INDEX IF NOT EXISTS metric_points_project ON metric_points (project_id, service, ts DESC);
+CREATE INDEX IF NOT EXISTS log_events_project ON log_events (project_id, ts DESC);
+CREATE INDEX IF NOT EXISTS edge_points_project ON edge_points (project_id, ts DESC);
+CREATE INDEX IF NOT EXISTS deploys_project ON deploys (project_id, deployed_at DESC);
+CREATE INDEX IF NOT EXISTS incidents_project ON incidents (project_id, id DESC);
+CREATE INDEX IF NOT EXISTS source_events_project ON source_events (project_id, active_until DESC);

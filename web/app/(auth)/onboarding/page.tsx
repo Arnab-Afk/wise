@@ -5,7 +5,7 @@ import { Check, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
-const STEPS = ["Workspace", "Project", "Team"];
+const STEPS = ["Workspace", "Project", "Connect", "Team"];
 
 async function call(path: string, method = "GET", body?: unknown) {
   const ws = localStorage.getItem("tw_workspace");
@@ -27,9 +27,13 @@ export default function Onboarding() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
+  const [key, setKey] = useState("");
+  const [copied, setCopied] = useState(false);
   useEffect(() => {
+    const fresh = new URLSearchParams(window.location.search).has("new");  // "New workspace" from the switcher
     call("/v1/auth/me").then((me) => {
-      if (me.workspace) location.href = "/incidents";
+      if (me.workspace && me.project && !fresh) window.location.assign("/incidents");
+      else if (me.workspace && !fresh) { setWorkspace(me.workspace); setStep(1); }  // has a workspace, no project yet
       else setName(me.name ? `${me.name.split(" ")[0]}'s team` : "");
     }).catch(() => {});
   }, []);
@@ -45,8 +49,10 @@ export default function Onboarding() {
     setWorkspace(ws); setStep(1);
   }); };
   const createProject = (e: React.FormEvent) => { e.preventDefault(); run(async () => {
-    await call(`/v1/workspaces/${workspace!.id}/projects`, "POST", { name: project });
-    setStep(2);
+    const p = await call(`/v1/workspaces/${workspace!.id}/projects`, "POST", { name: project });
+    localStorage.setItem("tw_project", String(p.id));
+    const k = await call(`/v1/projects/${p.id}/keys`, "POST", { name: "Default" });
+    setKey(k.key); setStep(2);
   }); };
   const invite = (e: React.FormEvent) => { e.preventDefault(); run(async () => {
     if (emails.trim()) await call(`/v1/workspaces/${workspace!.id}/invites`, "POST", { emails, role });
@@ -92,6 +98,27 @@ export default function Onboarding() {
           </form>
         )}
         {step === 2 && (
+          <div className="flex flex-col gap-4">
+            <div>
+              <h1 className="text-[20px] font-medium tracking-tight">Send your first telemetry</h1>
+              <p className="mt-1.5 text-muted-foreground">This is {project}&apos;s ingest key. Copy it now; it won&apos;t be shown again.</p>
+            </div>
+            <div className="flex items-center gap-2 rounded-lg border bg-sidebar px-3 py-2.5">
+              <code className="min-w-0 flex-1 font-mono text-[12px] break-all">{key}</code>
+              <button type="button" onClick={() => { navigator.clipboard?.writeText(key); setCopied(true); }}
+                className="rounded-md border bg-background px-2 py-1 text-[12px]">{copied ? "Copied" : "Copy"}</button>
+            </div>
+            <div className="text-[12.5px]">
+              <p className="micro mb-1.5">on a server (pm2, systemd, Docker, Kubernetes, log files)</p>
+              <pre className="overflow-x-auto rounded-lg border bg-sidebar/60 p-3 font-mono text-[11.5px] leading-relaxed">{`curl -fsSL ${location.origin.replace("://wise.", "://wise-api.")}/agent/install.sh | sh
+tracewise login --url ${location.origin.replace("://wise.", "://wise-api.")} --key ${key.slice(0, 12)}…
+tracewise detect && tracewise init && tracewise run`}</pre>
+              <p className="mt-2 text-muted-foreground">Or connect Prometheus, Datadog, Grafana, OpenTelemetry and more from Sources later.</p>
+            </div>
+            <Button size="lg" className="h-10" onClick={() => setStep(3)}>Continue</Button>
+          </div>
+        )}
+        {step === 3 && (
           <form onSubmit={invite} className="flex flex-col gap-4">
             <div>
               <h1 className="text-[20px] font-medium tracking-tight">Invite your team</h1>

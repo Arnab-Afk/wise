@@ -8,9 +8,9 @@ ESCALATED_QUIET_MINUTES = 30  # a human has it; don't reopen the same problem ev
 MIN_BASELINE_REQUESTS = 30    # one stray data point isn't a baseline
 
 
-def neighbours() -> dict[str, set[str]]:
+def neighbours(project_id: int) -> dict[str, set[str]]:
     adj: dict[str, set[str]] = {}
-    for e in db.query("SELECT src, dst FROM service_edges"):
+    for e in db.query("SELECT src, dst FROM service_edges WHERE project_id = %s", project_id):
         adj.setdefault(e["src"], set()).add(e["dst"])
         adj.setdefault(e["dst"], set()).add(e["src"])
     return adj
@@ -32,7 +32,13 @@ def components(services: list[str], adj: dict[str, set[str]]) -> list[set[str]]:
 
 
 def tick() -> None:
-    snap = {s["service"]: s for s in health.snapshot()}
+    """Check every project that has reported anything in the last day."""
+    for row in db.query("SELECT DISTINCT project_id FROM services WHERE last_seen > now() - interval '1 day'"):
+        tick_project(row["project_id"])
+
+
+def tick_project(project_id: int) -> None:
+    snap = {s["service"]: s for s in health.snapshot(project_id)}
     unhealthy = [name for name, s in snap.items()
                  if s["status"] != "healthy"
                  and (s["baseline_requests"] >= MIN_BASELINE_REQUESTS
@@ -41,10 +47,10 @@ def tick() -> None:
         return
     recently_resolved = {
         svc for row in db.query(
-            "SELECT services FROM incidents WHERE (status = 'resolved'"
+            "SELECT services FROM incidents WHERE project_id = %s AND ((status = 'resolved'"
             " AND resolved_at > now() - make_interval(secs => %s)) OR (status = 'escalated'"
-            " AND coalesce(resolved_at, opened_at) > now() - make_interval(mins => %s))",
-            RESOLVED_GRACE_SECONDS, ESCALATED_QUIET_MINUTES)
+            " AND coalesce(resolved_at, opened_at) > now() - make_interval(mins => %s)))",
+            project_id, RESOLVED_GRACE_SECONDS, ESCALATED_QUIET_MINUTES)
         for svc in row["services"]
         # A new alert is new information even right after a human took over.
         if snap.get(svc, {}).get("status") != "alerting"}
@@ -52,14 +58,14 @@ def tick() -> None:
     if not unhealthy:
         return
 
-    adj = neighbours()
-    active = db.query("SELECT id, services FROM incidents WHERE status = ANY(%s) ORDER BY id",
-                      list(ACTIVE))
+    adj = neighbours(project_id)
+    active = db.query("SELECT id, services FROM incidents WHERE project_id = %s AND status = ANY(%s) ORDER BY id",
+                      project_id, list(ACTIVE))
     for group in components(unhealthy, adj):
         touching = group | {n for s in group for n in adj.get(s, ())}
         incident = next((i for i in active if touching & set(i["services"])), None)
         signals = [signal(snap[s]) for s in sorted(group)]
-        claim_alerts(incident["id"] if incident else None, group)
+        claim_alerts(project_id, incident["id"] if incident else None, group)
         if incident:
             new = sorted(group - set(incident["services"]))
             if new:
@@ -70,28 +76,39 @@ def tick() -> None:
                             {"signals": [signal(snap[s]) for s in new]})
             continue
         title = describe(group, snap)
-        scenario = db.one("SELECT id, name FROM scenario_runs WHERE ended_at IS NULL"
+        scenario = db.one("SELECT id, name FROM scenario_runs WHERE project_id = %s AND ended_at IS NULL"
                           " AND incident_id IS NULL AND started_at > now() - interval '15 minutes'"
-                          " ORDER BY id DESC LIMIT 1")
+                          " ORDER BY id DESC LIMIT 1", project_id)
         row = db.one(
-            "INSERT INTO incidents (title, services, signals, severity, scenario)"
-            " VALUES (%s, %s, %s, %s, %s) RETURNING id", title, sorted(group), db.jsonb(signals),
-            "critical" if "gateway" in group else "high", scenario["name"] if scenario else None)
+            "INSERT INTO incidents (project_id, title, services, signals, severity, scenario)"
+            " VALUES (%s, %s, %s, %s, %s, %s) RETURNING id", project_id, title, sorted(group), db.jsonb(signals),
+            severity(project_id, group, snap), scenario["name"] if scenario else None)
         if scenario:
             db.query("UPDATE scenario_runs SET incident_id = %s WHERE id = %s", row["id"],
                      scenario["id"])
-        claim_alerts(row["id"], group)
+        claim_alerts(project_id, row["id"], group)
         db.add_step(row["id"], "detector", title, {"signals": signals})
-        db.notify("incident_events", {"type": "incident_opened", "incident_id": row["id"]})
+        db.notify("incident_events", {"type": "incident_opened", "incident_id": row["id"], "project_id": project_id})
         active.append({"id": row["id"], "services": sorted(group)})
 
 
-def claim_alerts(incident_id: int | None, services: set[str]) -> None:
+def claim_alerts(project_id: int, incident_id: int | None, services: set[str]) -> None:
     """Link the alerts behind an incident to it, so they can't open another one later."""
     if incident_id:
-        db.query("UPDATE source_events SET incident_id = %s WHERE service = ANY(%s)"
+        db.query("UPDATE source_events SET incident_id = %s WHERE project_id = %s AND service = ANY(%s)"
                  " AND status = 'firing' AND active_until > now() AND incident_id IS NULL",
-                 incident_id, sorted(services))
+                 incident_id, project_id, sorted(services))
+
+
+def severity(project_id: int, group: set[str], snap: dict) -> str:
+    """Critical when users feel it: an entry point (called by nothing we know of) is failing or
+    silent, or a connected tool raised a critical alert. High otherwise."""
+    if any(a.get("severity") == "critical" for s in group for a in snap[s].get("alerts") or []):
+        return "critical"
+    called = {r["dst"] for r in db.query("SELECT DISTINCT dst FROM service_edges WHERE project_id = %s", project_id)}
+    calls = {r["src"] for r in db.query("SELECT DISTINCT src FROM service_edges WHERE project_id = %s", project_id)}
+    entry_points = calls - called
+    return "critical" if group & entry_points else "high"
 
 
 def signal(s: dict) -> dict:

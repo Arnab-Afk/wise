@@ -24,19 +24,21 @@ def public_url(request: Request) -> str:
 @router.get("/source-types")
 def source_types(request: Request):
     """Everything Tracewise can read from, with setup steps for this install."""
-    from .receivers import ingest_key
     pull = [cls.describe() for kind, cls in KINDS.items() if kind != "opensearch"]
-    # Only fill in the real key for callers who already have it.
-    key = config.INGEST_KEY if config.INGEST_KEY and ingest_key(request) == config.INGEST_KEY else "<ingest key>"
-    return {"pull": pull, "push": catalog.render(public_url(request), key, SYSLOG_PORT)}
+    # Keys are per project and shown once when created, so the snippets carry a placeholder.
+    return {"pull": pull, "push": catalog.render(public_url(request), "<project ingest key>", SYSLOG_PORT)}
+
+
+def pid(request: Request) -> int:
+    return request.state.auth["project"]["id"]
 
 
 @router.get("/sources")
-def list_sources():
-    rows = db.query(f"SELECT {PUBLIC} FROM sources ORDER BY mode, kind, name")
+def list_sources(request: Request):
+    rows = db.query(f"SELECT {PUBLIC} FROM sources WHERE project_id = %s ORDER BY mode, kind, name", pid(request))
     recent = {r["source"]: r for r in db.query(
-        "SELECT source, count(*) AS logs_1h, max(ts) AS last_log FROM log_events"
-        " WHERE ts > now() - interval '1 hour' AND source IS NOT NULL GROUP BY source")}
+        "SELECT source, count(*) AS logs_1h, max(ts) AS last_log FROM log_events WHERE project_id = %s"
+        " AND ts > now() - interval '1 hour' AND source IS NOT NULL GROUP BY source", pid(request))}
     for r in rows:
         key = r["kind"] if r["mode"] == "pull" else (
             r["kind"] if r["name"] == r["kind"] else f"{r['kind']}:{r['name']}")
@@ -70,9 +72,9 @@ def create_source(body: dict, request: Request):
     name = body.get("name") or kind
     try:
         row = db.one(
-            f"INSERT INTO sources (kind, name, mode, config, credential, secret_fields, status)"
-            f" VALUES (%s, %s, 'pull', %s, %s, %s, 'testing') RETURNING {PUBLIC}",
-            kind, name, db.jsonb(cfg), secrets.encrypt(json.dumps(sec)) if sec else None, sorted(sec))
+            f"INSERT INTO sources (project_id, kind, name, mode, config, credential, secret_fields, status)"
+            f" VALUES (%s, %s, %s, 'pull', %s, %s, %s, 'testing') RETURNING {PUBLIC}",
+            pid(request), kind, name, db.jsonb(cfg), secrets.encrypt(json.dumps(sec)) if sec else None, sorted(sec))
         ctx = getattr(request.state, "auth", None)
         if ctx and ctx.get("workspace"):
             from .. import emails
@@ -87,8 +89,8 @@ def create_source(body: dict, request: Request):
 
 
 @router.patch("/sources/{source_id}")
-def update_source(source_id: int, body: dict):
-    row = db.one("SELECT * FROM sources WHERE id = %s", source_id)
+def update_source(source_id: int, body: dict, request: Request):
+    row = db.one("SELECT * FROM sources WHERE id = %s AND project_id = %s", source_id, pid(request))
     if not row:
         raise HTTPException(404, "source not found")
     if "enabled" in body:
@@ -105,17 +107,17 @@ def update_source(source_id: int, body: dict):
 
 
 @router.post("/sources/{source_id}/test")
-def test_source(source_id: int):
+def test_source(source_id: int, request: Request):
     row = db.one(f"UPDATE sources SET status = 'testing', status_detail = NULL WHERE id = %s"
-                 f" AND mode = 'pull' RETURNING {PUBLIC}", source_id)
+                 f" AND project_id = %s AND mode = 'pull' RETURNING {PUBLIC}", source_id, pid(request))
     if not row:
         raise HTTPException(404, "pull source not found")
     return row
 
 
 @router.delete("/sources/{source_id}")
-def delete_source(source_id: int):
-    db.query("DELETE FROM sources WHERE id = %s", source_id)
+def delete_source(source_id: int, request: Request):
+    db.query("DELETE FROM sources WHERE id = %s AND project_id = %s", source_id, pid(request))
     return {"deleted": True}
 
 
@@ -125,9 +127,9 @@ def instance(row: dict):
 
 
 @router.post("/sources/{source_id}/query")
-def query_source(source_id: int, body: dict):
+def query_source(source_id: int, body: dict, request: Request):
     """Run a query in the source's own language (PromQL, LogQL, NRQL, KQL, SPL...)."""
-    row = db.one("SELECT * FROM sources WHERE id = %s AND mode = 'pull'", source_id)
+    row = db.one("SELECT * FROM sources WHERE id = %s AND project_id = %s AND mode = 'pull'", source_id, pid(request))
     if not row:
         raise HTTPException(404, "pull source not found")
     try:
@@ -137,11 +139,11 @@ def query_source(source_id: int, body: dict):
 
 
 @router.get("/events")
-def list_events(active: bool = False, service: str | None = None, limit: int = 100):
+def list_events(request: Request, active: bool = False, service: str | None = None, limit: int = 100):
     return db.query(
-        "SELECT * FROM source_events WHERE (NOT %s OR (status = 'firing' AND active_until > now()))"
+        "SELECT * FROM source_events WHERE project_id = %s AND (NOT %s OR (status = 'firing' AND active_until > now()))"
         " AND (%s::text IS NULL OR service = %s) ORDER BY last_seen DESC LIMIT %s",
-        active, service, service, limit)
+        pid(request), active, service, service, min(limit, 500))
 
 
 agent_router = APIRouter()

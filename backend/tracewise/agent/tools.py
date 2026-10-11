@@ -1,5 +1,6 @@
 """The agent's tools. Each one returns a JSON-serialisable result or raises ToolError."""
 
+import contextvars
 import json
 import subprocess
 import time
@@ -16,10 +17,34 @@ class ToolError(Exception):
     pass
 
 
+# The project the current incident belongs to; set by the agent loop for each run.
+PROJECT: contextvars.ContextVar[dict] = contextvars.ContextVar("project")
+
+
+def P() -> int:
+    return PROJECT.get()["id"]
+
+
+def repo() -> str:
+    path = PROJECT.get().get("repo_path")
+    if not path:
+        raise ToolError("This project has no code repository connected, so code tools aren't available. "
+                        "Use telemetry, and say in the handover which code you'd look at.")
+    return path
+
+
+def deployer_url() -> str:
+    url = PROJECT.get().get("deployer_url")
+    if not url:
+        raise ToolError("Tracewise can't deploy, roll back, restart or flip flags in this project yet (no deploy "
+                        "integration). Investigate fully and escalate with the exact command you'd run.")
+    return url
+
+
 # ---------- helpers ----------
 
 def git(*args: str, max_chars: int = 12000) -> str:
-    proc = subprocess.run(["git", "-C", config.SHOPFRONT_REPO, *args], capture_output=True,
+    proc = subprocess.run(["git", "-C", repo(), *args], capture_output=True,
                           text=True, timeout=30)
     if proc.returncode != 0:
         raise ToolError(proc.stderr.strip()[:500])
@@ -28,7 +53,7 @@ def git(*args: str, max_chars: int = 12000) -> str:
 
 def entire_graph(*args: str, max_chars: int = 12000) -> str:
     try:
-        proc = subprocess.run(["entire", "graph", *args], cwd=config.SHOPFRONT_REPO,
+        proc = subprocess.run(["entire", "graph", *args], cwd=repo(),
                               capture_output=True, text=True, timeout=120)
     except FileNotFoundError:
         raise ToolError("entire CLI is not installed in this environment")
@@ -43,7 +68,7 @@ def entire_graph(*args: str, max_chars: int = 12000) -> str:
 def entire_checkpoint(ref: str) -> str:
     """The agent session behind a commit: its intent, files and transcript."""
     try:
-        proc = subprocess.run(["entire", "checkpoint", "explain", ref], cwd=config.SHOPFRONT_REPO,
+        proc = subprocess.run(["entire", "checkpoint", "explain", ref], cwd=repo(),
                               capture_output=True, text=True, timeout=60)
     except FileNotFoundError:
         return "(entire CLI not installed)"
@@ -52,7 +77,7 @@ def entire_checkpoint(ref: str) -> str:
 
 def deployer(method: str, path: str, body: dict | None = None) -> dict:
     try:
-        resp = httpx.request(method, f"{config.DEPLOYER_URL}{path}", json=body, timeout=60)
+        resp = httpx.request(method, f"{deployer_url()}{path}", json=body, timeout=60)
     except httpx.HTTPError as exc:
         raise ToolError(f"deployer unreachable: {exc}")
     if resp.status_code >= 400:
@@ -67,7 +92,7 @@ def short(sha: str | None) -> str | None:
 # ---------- investigate ----------
 
 def get_service_health(ctx, service: str | None = None, window_seconds: int = 30):
-    return health.snapshot(max(10, min(window_seconds, 600)), service)
+    return health.snapshot(P(), max(10, min(window_seconds, 600)), service)
 
 
 def get_metrics(ctx, service: str, minutes: int = 10):
@@ -76,8 +101,8 @@ def get_metrics(ctx, service: str, minutes: int = 10):
                   sum(count) AS requests, sum(errors) AS errors,
                   round((sum(p95_ms * count) / nullif(sum(count), 0))::numeric, 1) AS p95_ms,
                   max(sha) AS sha
-           FROM metric_points WHERE service = %s AND ts > now() - make_interval(mins => %s)
-           GROUP BY 1 ORDER BY 1""", service, max(1, min(minutes, 60)))
+           FROM metric_points WHERE project_id = %s AND service = %s AND ts > now() - make_interval(mins => %s)
+           GROUP BY 1 ORDER BY 1""", P(), service, max(1, min(minutes, 60)))
     return [{"t": r["bucket"].strftime("%H:%M:%S"), "requests": int(r["requests"]),
              "error_rate": round(r["errors"] / r["requests"], 3) if r["requests"] else 0,
              "p95_ms": float(r["p95_ms"]) if r["p95_ms"] is not None else None,
@@ -91,12 +116,12 @@ def search_logs(ctx, service: str | None = None, contains: str | None = None,
                   max(ts) AS last_seen, min(ts) AS first_seen,
                   (array_agg(trace ORDER BY ts DESC) FILTER (WHERE trace IS NOT NULL))[1] AS sample_trace
            FROM log_events
-           WHERE ts > now() - make_interval(mins => %s)
+           WHERE project_id = %s AND ts > now() - make_interval(mins => %s)
              AND (%s::text IS NULL OR service = %s)
              AND (%s::text IS NULL OR message ILIKE '%%' || %s || '%%' OR trace ILIKE '%%' || %s || '%%')
              AND level = ANY(%s)
            GROUP BY service, level, message, route, status, sha, source ORDER BY n DESC LIMIT %s""",
-        max(1, min(minutes, 120)), service, service, contains, contains, contains,
+        P(), max(1, min(minutes, 120)), service, service, contains, contains, contains,
         LEVELS[LEVELS.index(min_level if min_level in LEVELS else "warning"):],
         max(1, min(limit, 40)))
     for r in rows:
@@ -115,8 +140,8 @@ def list_events(ctx, service: str | None = None, minutes: int = 60):
         """SELECT service, source, kind, severity, status, title, started_at, last_seen,
                   (status = 'firing' AND active_until > now()) AS active, detail
            FROM source_events
-           WHERE last_seen > now() - make_interval(mins => %s) AND (%s::text IS NULL OR service = %s)
-           ORDER BY last_seen DESC LIMIT 40""", max(1, min(minutes, 1440)), service, service)
+           WHERE project_id = %s AND last_seen > now() - make_interval(mins => %s) AND (%s::text IS NULL OR service = %s)
+           ORDER BY last_seen DESC LIMIT 40""", P(), max(1, min(minutes, 1440)), service, service)
     for r in rows:
         r["detail"] = json.dumps(r["detail"], default=str)[:600]
     return rows
@@ -126,7 +151,7 @@ def list_sources(ctx):
     """Connected telemetry sources, and for pull sources the query language query_source takes."""
     from ..sources.pull import KINDS
     rows = db.query("SELECT id, kind, name, mode, status, last_received_at, items_received FROM sources"
-                    " WHERE enabled ORDER BY mode, kind")
+                    " WHERE project_id = %s AND enabled ORDER BY mode, kind", P())
     for r in rows:
         cls = KINDS.get(r["kind"]) if r["mode"] == "pull" else None
         if cls and cls.query_language:
@@ -138,8 +163,8 @@ def query_source(ctx, source: str, query: str, minutes: int = 15):
     """Run a query against a connected tool (Prometheus, Loki, Datadog...) in its own language."""
     from ..collector import instance
     from ..sources.pull import SourceError
-    row = db.one("SELECT * FROM sources WHERE mode = 'pull' AND (name = %s OR kind = %s OR id::text = %s)"
-                 " ORDER BY (name = %s) DESC LIMIT 1", source, source, source, source)
+    row = db.one("SELECT * FROM sources WHERE project_id = %s AND mode = 'pull' AND (name = %s OR kind = %s OR id::text = %s)"
+                 " ORDER BY (name = %s) DESC LIMIT 1", P(), source, source, source, source)
     if not row:
         raise ToolError(f"No pull source called {source!r}; call list_sources")
     try:
@@ -157,8 +182,10 @@ def get_dependencies(ctx, service: str):
                   coalesce(sum(p.errors), 0) AS errors_last_min,
                   round(avg(p.avg_ms)::numeric, 1) AS avg_ms
            FROM service_edges e
-           LEFT JOIN edge_points p ON p.src = e.src AND p.dst = e.dst AND p.ts > now() - interval '60 seconds'
-           GROUP BY e.src, e.dst""")
+           LEFT JOIN edge_points p ON p.project_id = e.project_id AND p.src = e.src AND p.dst = e.dst
+                                   AND p.ts > now() - interval '60 seconds'
+           WHERE e.project_id = %s
+           GROUP BY e.src, e.dst""", P())
     callers: dict[str, list[str]] = {}
     for e in edges:
         callers.setdefault(e["dst"], []).append(e["src"])
@@ -185,9 +212,9 @@ def get_dependencies(ctx, service: str):
 def list_recent_deploys(ctx, service: str | None = None, minutes: int = 120):
     rows = db.query(
         """SELECT id, service, sha, prev_sha, author, message, actor, reason, deployed_at
-           FROM deploys WHERE deployed_at > now() - make_interval(mins => %s)
-             AND (%s::text IS NULL OR service = %s) AND actor <> 'bootstrap'
-           ORDER BY deployed_at DESC LIMIT 20""", max(1, min(minutes, 1440)), service, service)
+           FROM deploys WHERE project_id = %s AND deployed_at > now() - make_interval(mins => %s)
+             AND (%s::text IS NULL OR service = %s) AND coalesce(actor, '') <> 'bootstrap'
+           ORDER BY deployed_at DESC LIMIT 20""", P(), max(1, min(minutes, 1440)), service, service)
     for r in rows:
         r["sha"], r["prev_sha"] = short(r["sha"]), short(r["prev_sha"])
         r["minutes_ago"] = round((time.time() - r.pop("deployed_at").timestamp()) / 60, 1)
@@ -226,7 +253,7 @@ def explain_failure(ctx, text: str):
     """Resolve the symbols named in a stack trace or error message to code locations."""
     try:
         proc = subprocess.run(["entire", "graph", "explain", "--repo", ".", "--format", "agent",
-                               "--head", "--no-echo"], input=text, cwd=config.SHOPFRONT_REPO,
+                               "--head", "--no-echo"], input=text, cwd=repo(),
                               capture_output=True, text=True, timeout=120)
     except FileNotFoundError:
         raise ToolError("entire CLI is not installed in this environment")
@@ -246,13 +273,13 @@ def search_memory(ctx, query: str):
         """SELECT id, incident_id, services, symptoms, root_cause, fix, outcome, created_at,
                   ts_rank(search, websearch_to_tsquery('english', %s)) AS rank
            FROM memories
-           WHERE search @@ websearch_to_tsquery('english', %s)
-              OR symptoms %% %s OR root_cause %% %s
-           ORDER BY rank DESC, id DESC LIMIT 5""", query, query, query, query)
+           WHERE project_id = %s AND (search @@ websearch_to_tsquery('english', %s)
+              OR symptoms %% %s OR root_cause %% %s)
+           ORDER BY rank DESC, id DESC LIMIT 5""", query, P(), query, query, query)
     if not rows:
         rows = db.query("SELECT id, incident_id, services, symptoms, root_cause, fix, outcome,"
-                        " created_at FROM memories WHERE services && %s ORDER BY id DESC LIMIT 3",
-                        ctx["incident"]["services"])
+                        " created_at FROM memories WHERE project_id = %s AND services && %s ORDER BY id DESC LIMIT 3",
+                        P(), ctx["incident"]["services"])
     return rows or "No similar past incidents."
 
 
@@ -328,7 +355,9 @@ def restart_service(ctx, service: str, reason: str):
 
 def request_code_fix(ctx, service: str, problem: str, base_sha: str | None = None):
     """Ask the team's connected coding agent to write a tested fix on its own branch, and wait."""
-    conn = db.one("SELECT id, provider, status FROM connections ORDER BY is_default DESC, id LIMIT 1")
+    repo()  # a fix needs the code
+    conn = db.one("SELECT id, provider, status FROM connections WHERE workspace_id = %s"
+                  " ORDER BY is_default DESC, id LIMIT 1", PROJECT.get()["workspace_id"])
     if not conn:
         raise ToolError("No coding agent is connected. A teammate can connect Claude or Cursor in "
                         "Settings; until then, keep the rollback and escalate the code fix.")
@@ -340,9 +369,9 @@ def request_code_fix(ctx, service: str, problem: str, base_sha: str | None = Non
                       " AND status IN ('queued', 'running', 'ready') ORDER BY id DESC LIMIT 1",
                       incident["id"], service)
     job_id = existing["id"] if existing else db.one(
-        "INSERT INTO fix_jobs (incident_id, connection_id, provider, service, task, base_sha, branch)"
-        " VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
-        incident["id"], conn["id"], conn["provider"], service, problem, base,
+        "INSERT INTO fix_jobs (project_id, incident_id, connection_id, provider, service, task, base_sha, branch)"
+        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+        P(), incident["id"], conn["id"], conn["provider"], service, problem, base,
         f"tracewise/fix-incident-{incident['id']}-{service}")["id"]
     deadline = time.time() + 1080
     while time.time() < deadline:
@@ -372,7 +401,7 @@ def deploy_fix(ctx, job_id: int, reason: str):
 
     def go():
         # Fast-forward main so the next normal deploy doesn't bring the bug back.
-        merged = subprocess.run(["git", "-C", config.SHOPFRONT_REPO, "merge", "--ff-only",
+        merged = subprocess.run(["git", "-C", repo(), "merge", "--ff-only",
                                  job["branch"]], capture_output=True, text=True).returncode == 0
         r = deployer("POST", "/deploy", {"service": job["service"], "ref": job["commit_sha"],
                                          "actor": "tracewise", "reason": reason})
@@ -388,12 +417,12 @@ def verify_recovery(ctx, services: list[str], seconds: int = 45):
     deadline, samples = time.time() + seconds, []
     while time.time() < deadline:
         time.sleep(5)
-        snap = {s["service"]: s for s in health.snapshot(15)}
+        snap = {s["service"]: s for s in health.snapshot(P(), 15)}
         samples.append({svc: snap.get(svc, {}).get("status", "unknown") for svc in services})
         ctx["heartbeat"]()
     tail = samples[-6:]
     recovered = all(status == "healthy" for sample in tail for status in sample.values())
-    final = [s for s in health.snapshot(20) if s["service"] in services]
+    final = [s for s in health.snapshot(P(), 20) if s["service"] in services]
     return {"recovered": recovered, "watched_seconds": seconds,
             "status_over_time": samples, "final": final}
 
@@ -466,7 +495,7 @@ TOOLS = {
         "checkpoint (the agent session that produced it) if one exists.",
         S(sha=STR("Commit SHA (short is fine)"))),
     "code_search": (INVESTIGATE, code_search,
-        "Entire Graph ranked code search over the Shopfront repo from a plain-language description.",
+        "Entire Graph ranked code search over the project repo from a plain-language description.",
         S(query=STR("What you're looking for"))),
     "code_impact": (INVESTIGATE, code_impact,
         "Entire Graph blast radius for changing a symbol: callers, callees, type users, co-changed files.",
@@ -475,7 +504,7 @@ TOOLS = {
         "Give Entire Graph a stack trace or error text; it resolves the named symbols to file:line.",
         S(text=STR("Stack trace or error output"))),
     "read_code": (INVESTIGATE, read_code,
-        "Read a file from the Shopfront repo at a ref, with line numbers.",
+        "Read a file from the project repo at a ref, with line numbers.",
         S(path=STR("Repo-relative path"), ref=STR("Git ref, default HEAD", optional=True),
           start_line=INT("First line", optional=True), end_line=INT("Last line", optional=True))),
     "search_memory": (INVESTIGATE, search_memory,

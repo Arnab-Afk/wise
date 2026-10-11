@@ -26,16 +26,19 @@ def providers():
             for k, v in PROVIDERS.items()]
 
 
+def wid(request: Request) -> int:
+    return request.state.auth["workspace"]["id"]
+
+
 @router.get("/connections")
-def list_connections():
-    return db.query(f"SELECT {PUBLIC} FROM connections ORDER BY is_default DESC, id")
+def list_connections(request: Request):
+    return db.query(f"SELECT {PUBLIC} FROM connections WHERE workspace_id = %s ORDER BY is_default DESC, id",
+                    wid(request))
 
 
 def _tell_admins(request: Request, provider: str, label: str, connected: bool) -> None:
     from .workspaces import admins, display
-    ctx = getattr(request.state, "auth", None)
-    if not ctx or not ctx.get("workspace"):
-        return
+    ctx = request.state.auth
     for a in admins(ctx["workspace"]["id"]):
         emails.coding_agent_changed(a["email"], ctx["workspace"]["name"], provider, label, connected, display(ctx["user"]))
 
@@ -47,57 +50,64 @@ def create_connection(body: dict, request: Request):
         raise HTTPException(400, f"provider must be one of {sorted(PROVIDERS)}")
     if len(key) < 12 or not key.startswith(PROVIDERS[provider]["prefix"]):
         raise HTTPException(400, f"That doesn't look like a {PROVIDERS[provider]['credential']}.")
-    first = not db.one("SELECT 1 FROM connections LIMIT 1")
+    w = wid(request)
+    first = not db.one("SELECT 1 FROM connections WHERE workspace_id = %s LIMIT 1", w)
     row = db.one(
-        f"INSERT INTO connections (provider, label, credential, credential_hint, model, is_default,"
-        f" status) VALUES (%s, %s, %s, %s, %s, %s, 'testing') RETURNING {PUBLIC}",
-        provider, body.get("label") or PROVIDERS[provider]["name"], secrets.encrypt(key),
+        f"INSERT INTO connections (workspace_id, provider, label, credential, credential_hint, model, is_default,"
+        f" status) VALUES (%s, %s, %s, %s, %s, %s, %s, 'testing') RETURNING {PUBLIC}",
+        w, provider, body.get("label") or PROVIDERS[provider]["name"], secrets.encrypt(key),
         key[-4:], body.get("model") or PROVIDERS[provider]["default_model"],
         bool(body.get("is_default")) or first)
     if row["is_default"]:
-        db.query("UPDATE connections SET is_default = false WHERE id <> %s", row["id"])
+        db.query("UPDATE connections SET is_default = false WHERE workspace_id = %s AND id <> %s", w, row["id"])
     _tell_admins(request, provider, row["label"], True)
     return row
 
 
 @router.post("/connections/{connection_id}/test")
-def test_connection(connection_id: int):
+def test_connection(connection_id: int, request: Request):
     """The runner checks the key with the provider and updates the status."""
     row = db.one(f"UPDATE connections SET status = 'testing', status_detail = NULL WHERE id = %s"
-                 f" RETURNING {PUBLIC}", connection_id)
+                 f" AND workspace_id = %s RETURNING {PUBLIC}", connection_id, wid(request))
     if not row:
         raise HTTPException(404, "connection not found")
     return row
 
 
 @router.post("/connections/{connection_id}/default")
-def make_default(connection_id: int):
-    if not db.one("SELECT 1 FROM connections WHERE id = %s", connection_id):
+def make_default(connection_id: int, request: Request):
+    w = wid(request)
+    if not db.one("SELECT 1 FROM connections WHERE id = %s AND workspace_id = %s", connection_id, w):
         raise HTTPException(404, "connection not found")
-    db.query("UPDATE connections SET is_default = (id = %s)", connection_id)
-    return list_connections()
+    db.query("UPDATE connections SET is_default = (id = %s) WHERE workspace_id = %s", connection_id, w)
+    return list_connections(request)
 
 
 @router.delete("/connections/{connection_id}")
 def delete_connection(connection_id: int, request: Request):
-    row = db.one("DELETE FROM connections WHERE id = %s RETURNING provider, label", connection_id)
+    row = db.one("DELETE FROM connections WHERE id = %s AND workspace_id = %s RETURNING provider, label",
+                 connection_id, wid(request))
     if row:
         _tell_admins(request, row["provider"], row["label"], False)
     return {"deleted": True}
 
 
+def pid(request: Request) -> int:
+    return request.state.auth["project"]["id"]
+
+
 @router.get("/fix-jobs")
-def list_fix_jobs(incident_id: int | None = None):
+def list_fix_jobs(request: Request, incident_id: int | None = None):
     return db.query(
         "SELECT id, incident_id, provider, service, branch, status, commit_sha, checkpoint_id,"
-        " tests_passed, cost_usd, created_at, finished_at FROM fix_jobs"
-        " WHERE %s::bigint IS NULL OR incident_id = %s ORDER BY id DESC LIMIT 100",
-        incident_id, incident_id)
+        " tests_passed, cost_usd, created_at, finished_at FROM fix_jobs WHERE project_id = %s"
+        " AND (%s::bigint IS NULL OR incident_id = %s) ORDER BY id DESC LIMIT 100",
+        pid(request), incident_id, incident_id)
 
 
 @router.get("/fix-jobs/{job_id}")
-def get_fix_job(job_id: int):
-    row = db.one("SELECT * FROM fix_jobs WHERE id = %s", job_id)
+def get_fix_job(job_id: int, request: Request):
+    row = db.one("SELECT * FROM fix_jobs WHERE id = %s AND project_id = %s", job_id, pid(request))
     if not row:
         raise HTTPException(404, "fix job not found")
     return row

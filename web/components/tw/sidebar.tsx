@@ -2,10 +2,10 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useState } from "react";
-import { Activity, Bot, Cable, GitCommitHorizontal, LogOut, PanelLeft, Settings, Siren, Wrench } from "lucide-react";
-import { useMe } from "@/hooks/use-me";
-import { api, ACTIVE, type Incident } from "@/lib/api";
+import { useEffect, useRef, useState } from "react";
+import { Activity, Bot, Cable, Check, ChevronsUpDown, GitCommitHorizontal, LogOut, Plus, Settings, Siren, Wrench } from "lucide-react";
+import { canAdmin, useMe } from "@/hooks/use-me";
+import { api, ACTIVE, switchTo, type Incident } from "@/lib/api";
 import { usePoll, useStream } from "@/hooks/use-stream";
 import { cn } from "@/lib/utils";
 
@@ -16,7 +16,7 @@ const NAV = [
   { href: "/fixes", label: "fixes", icon: Wrench },
   { href: "/sources", label: "sources", icon: Cable },
   { href: "/agents", label: "coding agents", icon: Bot },
-  { href: "/settings/workspace", label: "settings", icon: Settings },
+  { href: "/settings/project", label: "settings", icon: Settings },
 ];
 
 export function SidebarNav() {
@@ -68,17 +68,65 @@ export function LiveActivity() {
   );
 }
 
-export function WorkspaceBadge({ onToggle }: { onToggle?: () => void }) {
+export function WorkspaceBadge() {
   const me = useMe();
+  const [open, setOpen] = useState(false);
+  const box = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const close = (e: MouseEvent) => { if (!box.current?.contains(e.target as Node)) setOpen(false); };
+    document.addEventListener("mousedown", close);
+    return () => document.removeEventListener("mousedown", close);
+  }, [open]);
+  const ws = me?.workspace;
   return (
-    <div className="flex items-center gap-2.5 px-1">
-      <span className="flex size-7 shrink-0 items-center justify-center rounded-lg bg-foreground font-mono text-[13px] font-semibold text-background">
-        {(me?.workspace?.name ?? "T").slice(0, 1).toUpperCase()}
-      </span>
-      <span className="truncate font-mono text-[13px]">{me?.workspace?.slug ?? "tracewise"}</span>
-      <button onClick={onToggle} className="ml-auto rounded-md p-1 text-muted-foreground hover:bg-black/[0.04]" aria-label="Collapse sidebar">
-        <PanelLeft className="size-4 stroke-[1.6]" />
+    <div ref={box} className="relative">
+      <button onClick={() => setOpen(!open)} className="flex w-full items-center gap-2.5 rounded-lg px-1 py-1 text-left hover:bg-black/[0.04]">
+        <span className="flex size-7 shrink-0 items-center justify-center rounded-lg bg-foreground font-mono text-[13px] font-semibold text-background">
+          {(ws?.name ?? "T").slice(0, 1).toUpperCase()}
+        </span>
+        <span className="min-w-0 flex-1">
+          <span className="block truncate text-[12px] text-muted-foreground">{ws?.name ?? "tracewise"}</span>
+          <span className="block truncate font-mono text-[13px]">{me?.project?.slug ?? "—"}</span>
+        </span>
+        <ChevronsUpDown className="size-3.5 shrink-0 text-muted-foreground" />
       </button>
+      {open && me && (
+        <div className="absolute top-full right-0 left-0 z-50 mt-1 rounded-xl border bg-background p-1.5 shadow-lg">
+          <p className="micro px-2 pt-1 pb-1.5">projects in {ws?.name}</p>
+          {me.projects.map((p) => (
+            <button key={p.id} onClick={() => switchTo(ws?.id ?? null, p.id)}
+              className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[13px] hover:bg-muted">
+              <span className="min-w-0 flex-1 truncate font-mono">{p.slug}</span>
+              {p.id === me.project?.id && <Check className="size-3.5" />}
+            </button>
+          ))}
+          {canAdmin(me) && (
+            <Link href="/settings/project#new" onClick={() => setOpen(false)}
+              className="flex items-center gap-2 rounded-md px-2 py-1.5 text-[13px] text-muted-foreground hover:bg-muted hover:text-foreground">
+              <Plus className="size-3.5" />New project
+            </Link>
+          )}
+          {me.workspaces.length > 1 && (
+            <>
+              <div className="my-1.5 border-t" />
+              <p className="micro px-2 pt-0.5 pb-1.5">workspaces</p>
+              {me.workspaces.map((w) => (
+                <button key={w.id} onClick={() => switchTo(w.id, null)}
+                  className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[13px] hover:bg-muted">
+                  <span className="min-w-0 flex-1 truncate">{w.name}</span>
+                  <span className="text-[11px] text-muted-foreground">{w.role}</span>
+                  {w.id === ws?.id && <Check className="size-3.5" />}
+                </button>
+              ))}
+            </>
+          )}
+          <div className="my-1.5 border-t" />
+          <Link href="/onboarding?new=1" className="flex items-center gap-2 rounded-md px-2 py-1.5 text-[13px] text-muted-foreground hover:bg-muted hover:text-foreground">
+            <Plus className="size-3.5" />New workspace
+          </Link>
+        </div>
+      )}
     </div>
   );
 }

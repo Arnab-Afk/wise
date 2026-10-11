@@ -88,6 +88,20 @@ Details and how each one was verified are in [docs/CONNECTORS.md](docs/CONNECTOR
 OpenSearch, Fluent Bit, Vector and the OTel Collector) against a two-service app with a fault
 switch. Start it with `integrations/lab/up.sh`.
 
+## Tenancy
+
+- A **workspace** is a team: its members, their roles and its coding-agent accounts.
+- A **project** is a system the team runs. Every service, metric, log, alert, deploy, incident, fix and memory
+  belongs to exactly one project, and every API query is filtered by it.
+- **Ingest keys** (`twk_…`) belong to a project and decide where incoming data lands. Create them under
+  Settings → Project; only a hash is stored and the key is shown once. Keys can't read other projects or
+  manage accounts.
+- The agent runs inside the incident's project: its telemetry, its memory, and that project's repository and
+  deploy integration. Projects without a deploy integration get a full investigation and a handover.
+- Repository paths and deployer URLs are set by the operator, never through the API.
+- Upgrading an older single-tenant database moves its data into a "Shopfront demo" workspace whose project keeps
+  the old `TW_INGEST_KEY`. People listed in `TW_BOOTSTRAP_OWNERS` become its owners when they sign in.
+
 ## Accounts, workspaces and email
 
 - **Sign in** with a one-time email code, Google or GitHub (`/login`). Sessions are httpOnly

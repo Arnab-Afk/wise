@@ -233,17 +233,19 @@ def log_from_dict(d: dict, service: str | None = None, default_level: str | None
 
 # ---------- storage ----------
 
-def register(kind: str, name: str, mode: str = "push") -> int:
+def register(kind: str, name: str, project_id: int, mode: str = "push") -> int:
     """Record that a push source exists (it shows up in the sources list from its first batch)."""
     row = db.one(
-        "INSERT INTO sources (kind, name, mode, status) VALUES (%s, %s, %s, 'receiving')"
-        " ON CONFLICT (kind, name) DO UPDATE SET last_received_at = now() RETURNING id",
-        kind, name[:120], mode)
+        "INSERT INTO sources (project_id, kind, name, mode, status) VALUES (%s, %s, %s, %s, 'receiving')"
+        " ON CONFLICT (project_id, kind, name) DO UPDATE SET last_received_at = now() RETURNING id",
+        project_id, kind, name[:120], mode)
     return row["id"]
 
 
-def store(source: str, logs=(), metrics=(), events=(), deploys=(), edges=(),
+def store(source: str | None, project_id: int, logs=(), metrics=(), events=(), deploys=(), edges=(),
           source_id: int | None = None) -> dict:
+    """Write one batch of normalised telemetry into a project."""
+    p = project_id
     logs, metrics, events, deploys, edges = (list(logs), list(metrics), list(events), list(deploys),
                                              list(edges))
     services = {service_name(x.get("service")) for x in logs + metrics + events + deploys}
@@ -251,56 +253,56 @@ def store(source: str, logs=(), metrics=(), events=(), deploys=(), edges=(),
     if services:
         # One statement in a fixed order: concurrent writers lock rows in the same order and
         # can't deadlock.
-        db.query("INSERT INTO services (name) SELECT unnest(%s::text[]) ORDER BY 1"
-                 " ON CONFLICT (name) DO UPDATE SET last_seen = now()", sorted(services))
+        db.query("INSERT INTO services (project_id, name) SELECT %s, unnest(%s::text[]) ORDER BY 2"
+                 " ON CONFLICT (project_id, name) DO UPDATE SET last_seen = now()", p, sorted(services))
 
     rows = []
     for l in logs:
         message, trace = l.get("message") or "", l.get("trace")
         if not trace:
             message, trace = split_trace(message)
-        rows.append((service_name(l.get("service")), to_ts(l.get("ts")), l.get("sha"),
+        rows.append((p, service_name(l.get("service")), to_ts(l.get("ts")), l.get("sha"),
                      l.get("level") or guess_level(message), message[:4000] or "(empty)",
                      l.get("route"), l.get("status"), (trace or None) and trace[-6000:],
                      db.jsonb(l.get("fields") or {}), source, max(1, int(l.get("count") or 1))))
-    db.many("INSERT INTO log_events (service, ts, sha, level, message, route, status, trace, fields,"
-            " source, count) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)", rows)
+    db.many("INSERT INTO log_events (project_id, service, ts, sha, level, message, route, status, trace,"
+            " fields, source, count) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)", rows)
 
-    db.many("INSERT INTO metric_points (service, ts, sha, count, errors, p50_ms, p95_ms, max_ms,"
-            " source) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
-            [(service_name(m["service"]), to_ts(m.get("ts")), m.get("sha"), int(m.get("count") or 0),
+    db.many("INSERT INTO metric_points (project_id, service, ts, sha, count, errors, p50_ms, p95_ms, max_ms,"
+            " source) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            [(p, service_name(m["service"]), to_ts(m.get("ts")), m.get("sha"), int(m.get("count") or 0),
               int(m.get("errors") or 0), float(m.get("p50_ms") or 0), float(m.get("p95_ms") or 0),
               float(m.get("max_ms") or m.get("p95_ms") or 0), source) for m in metrics])
     for m in metrics:
         if m.get("sha"):
-            db.query("UPDATE services SET current_sha = %s WHERE name = %s", m["sha"],
+            db.query("UPDATE services SET current_sha = %s WHERE project_id = %s AND name = %s", m["sha"], p,
                      service_name(m["service"]))
 
     for e in edges:
         src, dst = service_name(e["src"]), service_name(e["dst"])
-        db.query("INSERT INTO service_edges (src, dst, calls, errors) VALUES (%s, %s, %s, %s)"
-                 " ON CONFLICT (src, dst) DO UPDATE SET calls = service_edges.calls + EXCLUDED.calls,"
+        db.query("INSERT INTO service_edges (project_id, src, dst, calls, errors) VALUES (%s, %s, %s, %s, %s)"
+                 " ON CONFLICT (project_id, src, dst) DO UPDATE SET calls = service_edges.calls + EXCLUDED.calls,"
                  " errors = service_edges.errors + EXCLUDED.errors, last_seen = now()",
-                 src, dst, int(e["calls"]), int(e["errors"]))
-        db.query("INSERT INTO edge_points (src, dst, ts, calls, errors, avg_ms)"
-                 " VALUES (%s, %s, %s, %s, %s, %s)", src, dst, to_ts(e.get("ts")), int(e["calls"]),
+                 p, src, dst, int(e["calls"]), int(e["errors"]))
+        db.query("INSERT INTO edge_points (project_id, src, dst, ts, calls, errors, avg_ms)"
+                 " VALUES (%s, %s, %s, %s, %s, %s, %s)", p, src, dst, to_ts(e.get("ts")), int(e["calls"]),
                  int(e["errors"]), float(e.get("avg_ms") or 0))
 
     for e in events:
-        upsert_event(source, e)
+        upsert_event(source or "api", p, e)
 
     for d in deploys:
         row = db.one(
-            "INSERT INTO deploys (service, sha, prev_sha, author, author_email, message,"
+            "INSERT INTO deploys (project_id, service, sha, prev_sha, author, author_email, message,"
             " committed_at, actor, reason, deployed_at)"
-            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
-            service_name(d["service"]), str(d["sha"])[:80], d.get("prev_sha"), d.get("author"),
+            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+            p, service_name(d["service"]), str(d["sha"])[:80], d.get("prev_sha"), d.get("author"),
             d.get("author_email"), (d.get("message") or "")[:2000] or None,
             d.get("committed_at"), d.get("actor") or source, d.get("reason"),
             to_ts(d.get("deployed_at")))
-        db.query("UPDATE services SET current_sha = %s WHERE name = %s", str(d["sha"])[:80],
-                 service_name(d["service"]))
-        db.notify("system_events", {"type": "deploy", "deploy_id": row["id"],
+        db.query("UPDATE services SET current_sha = %s WHERE project_id = %s AND name = %s", str(d["sha"])[:80],
+                 p, service_name(d["service"]))
+        db.notify("system_events", {"type": "deploy", "deploy_id": row["id"], "project_id": p,
                                     "service": service_name(d["service"]), "sha": d["sha"]})
 
     n = len(logs) + len(metrics) + len(events) + len(deploys) + len(edges)
@@ -314,7 +316,7 @@ def store(source: str, logs=(), metrics=(), events=(), deploys=(), edges=(),
 ONE_SHOT = ("crash", "restart", "oom", "deploy_failed", "info")
 
 
-def upsert_event(source: str, e: dict) -> None:
+def upsert_event(source: str, project_id: int, e: dict) -> None:
     ts = to_ts(e.get("ts"))
     kind = e.get("kind") or "alert"
     status = "resolved" if str(e.get("status", "firing")).lower() in (
@@ -335,22 +337,24 @@ def upsert_event(source: str, e: dict) -> None:
     fingerprint = str(e.get("fingerprint") or (
         f"{kind}:{service}:{int(ts.timestamp())}" if kind in ONE_SHOT
         else f"{kind}:{service}:{e.get('title')}"))[:300]
+    db.query("INSERT INTO services (project_id, name) VALUES (%s, %s) ON CONFLICT (project_id, name)"
+             " DO UPDATE SET last_seen = now()", project_id, service)
     row = db.one(
-        """INSERT INTO source_events (source, service, fingerprint, kind, severity, status, title,
+        """INSERT INTO source_events (project_id, source, service, fingerprint, kind, severity, status, title,
                                       detail, started_at, last_seen, active_until)
-           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, now(), %s)
-           ON CONFLICT (source, fingerprint) DO UPDATE SET
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), %s)
+           ON CONFLICT (project_id, source, fingerprint) DO UPDATE SET
                status = EXCLUDED.status, severity = EXCLUDED.severity, title = EXCLUDED.title,
                detail = EXCLUDED.detail, last_seen = now(), active_until = EXCLUDED.active_until,
                started_at = CASE WHEN source_events.status = 'resolved' AND EXCLUDED.status = 'firing'
                                  THEN EXCLUDED.started_at ELSE source_events.started_at END,
                incident_id = CASE WHEN source_events.status = 'resolved' AND EXCLUDED.status = 'firing'
                                   THEN NULL ELSE source_events.incident_id END
-           RETURNING id, (xmax = 0) AS inserted""",
-        source, service, fingerprint, kind, severity, status, str(e.get("title") or kind)[:500],
+           RETURNING id""",
+        project_id, source, service, fingerprint, kind, severity, status, str(e.get("title") or kind)[:500],
         db.jsonb(e.get("detail") or {}), ts, active_until)
-    db.notify("system_events", {"type": "source_event", "event_id": row["id"], "service": service,
-                                "status": status, "severity": severity})
+    db.notify("system_events", {"type": "source_event", "event_id": row["id"], "project_id": project_id,
+                                "service": service, "status": status, "severity": severity})
 
 
 def now_ts() -> float:

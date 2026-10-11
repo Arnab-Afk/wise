@@ -10,14 +10,14 @@ BASELINE_MINUTES = 15
 BASELINE_GAP_SECONDS = 60
 
 
-def snapshot(window_seconds: int = RECENT_SECONDS, service: str | None = None) -> list[dict]:
+def snapshot(project_id: int, window_seconds: int = RECENT_SECONDS, service: str | None = None) -> list[dict]:
     rows = db.query(
         """
         WITH recent AS (
             SELECT service, sum(count) AS count, sum(errors) AS errors,
                    sum(p95_ms * count) / nullif(sum(count), 0) AS p95_ms,
                    max(ts) AS last_seen
-            FROM metric_points WHERE ts > now() - make_interval(secs => %s)
+            FROM metric_points WHERE project_id = %s AND ts > now() - make_interval(secs => %s)
             GROUP BY service
         ),
         baseline AS (
@@ -28,7 +28,7 @@ def snapshot(window_seconds: int = RECENT_SECONDS, service: str | None = None) -
                    percentile_cont(0.5) WITHIN GROUP (ORDER BY p95_ms)
                        FILTER (WHERE count > 0) AS p95_ms
             FROM metric_points
-            WHERE ts BETWEEN now() - make_interval(mins => %s)
+            WHERE project_id = %s AND ts BETWEEN now() - make_interval(mins => %s)
                          AND now() - make_interval(secs => %s)
             GROUP BY service
         )
@@ -37,23 +37,23 @@ def snapshot(window_seconds: int = RECENT_SECONDS, service: str | None = None) -
                r.p95_ms, r.last_seen,
                coalesce(b.count, 0) AS baseline_count, b.error_rate AS baseline_error_rate,
                b.p95_ms AS baseline_p95_ms,
-               (SELECT max(ts) FROM metric_points m WHERE m.service = s.name) AS last_point,
-               (SELECT source FROM metric_points m WHERE m.service = s.name
+               (SELECT max(ts) FROM metric_points m WHERE m.project_id = s.project_id AND m.service = s.name) AS last_point,
+               (SELECT source FROM metric_points m WHERE m.project_id = s.project_id AND m.service = s.name
                 ORDER BY ts DESC LIMIT 1) AS last_source
         FROM services s
         LEFT JOIN recent r ON r.service = s.name
         LEFT JOIN baseline b ON b.service = s.name
-        WHERE %s::text IS NULL OR s.name = %s
+        WHERE s.project_id = %s AND (%s::text IS NULL OR s.name = %s)
         ORDER BY s.name
         """,
-        window_seconds, BASELINE_MINUTES, BASELINE_GAP_SECONDS, service, service)
-    alerts = active_alerts(service)
+        project_id, window_seconds, project_id, BASELINE_MINUTES, BASELINE_GAP_SECONDS, project_id, service, service)
+    alerts = active_alerts(project_id, service)
     # Pull sources that were switched off or removed: their services went quiet on purpose.
     disconnected = {f"{r['kind']}:{r['name']}" for r in db.query(
-        "SELECT kind, name FROM sources WHERE mode = 'pull' AND NOT enabled")}
+        "SELECT kind, name FROM sources WHERE project_id = %s AND mode = 'pull' AND NOT enabled", project_id)}
     live_pull = {f"{r['kind']}:{r['name']}" for r in db.query(
-        "SELECT kind, name FROM sources WHERE mode = 'pull' AND enabled")}
-    log_errors = log_error_rates(window_seconds, service)
+        "SELECT kind, name FROM sources WHERE project_id = %s AND mode = 'pull' AND enabled", project_id)}
+    log_errors = log_error_rates(project_id, window_seconds, service)
     out = []
     for r in rows:
         rate = r["errors"] / r["count"] if r["count"] else 0.0
@@ -93,20 +93,20 @@ def snapshot(window_seconds: int = RECENT_SECONDS, service: str | None = None) -
     return out
 
 
-def active_alerts(service: str | None = None) -> dict[str, list[dict]]:
+def active_alerts(project_id: int, service: str | None = None) -> dict[str, list[dict]]:
     """Firing alerts, crashes, restarts and failed checks reported by connected sources."""
     out: dict[str, list[dict]] = {}
     for e in db.query(
             "SELECT e.service, e.source, e.kind, e.severity, e.title, e.started_at, e.incident_id,"
             "       coalesce(i.status IN ('resolved', 'escalated'), false) AS handled"
             " FROM source_events e LEFT JOIN incidents i ON i.id = e.incident_id"
-            " WHERE e.status = 'firing' AND e.active_until > now()"
-            " AND (%s::text IS NULL OR e.service = %s) ORDER BY e.started_at DESC", service, service):
+            " WHERE e.project_id = %s AND e.status = 'firing' AND e.active_until > now()"
+            " AND (%s::text IS NULL OR e.service = %s) ORDER BY e.started_at DESC", project_id, service, service):
         out.setdefault(e["service"], []).append(e)
     return out
 
 
-def log_error_rates(window_seconds: int, service: str | None = None) -> dict[str, dict]:
+def log_error_rates(project_id: int, window_seconds: int, service: str | None = None) -> dict[str, dict]:
     rows = db.query(
         """
         SELECT service,
@@ -114,13 +114,13 @@ def log_error_rates(window_seconds: int, service: str | None = None) -> dict[str
                coalesce(sum(count) FILTER (WHERE ts <= now() - make_interval(secs => %s)), 0) AS base,
                min(ts) < now() - make_interval(mins => 3) AS known
         FROM log_events
-        WHERE level IN ('error', 'critical') AND ts > now() - make_interval(mins => %s)
+        WHERE project_id = %s AND level IN ('error', 'critical') AND ts > now() - make_interval(mins => %s)
           AND (%s::text IS NULL OR service = %s)
         GROUP BY service
-        """, window_seconds, BASELINE_GAP_SECONDS, BASELINE_MINUTES, service, service)
+        """, window_seconds, BASELINE_GAP_SECONDS, project_id, BASELINE_MINUTES, service, service)
     windows = (BASELINE_MINUTES * 60 - BASELINE_GAP_SECONDS) / window_seconds
     known = {r["name"] for r in db.query(
-        "SELECT name FROM services WHERE first_seen < now() - interval '3 minutes'")}
+        "SELECT name FROM services WHERE project_id = %s AND first_seen < now() - interval '3 minutes'", project_id)}
     return {r["service"]: {"recent": int(r["recent"]),
                            "baseline": round(float(r["base"]) / windows, 1),
                            "known": r["service"] in known}

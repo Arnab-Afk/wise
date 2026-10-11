@@ -34,7 +34,8 @@ def load_run(incident: dict) -> dict:
     run = db.one("SELECT * FROM agent_runs WHERE incident_id = %s", incident["id"])
     if run:
         return run
-    last_deploy = db.one("SELECT coalesce(max(id), 0) AS id FROM deploys")["id"]
+    last_deploy = db.one("SELECT coalesce(max(id), 0) AS id FROM deploys WHERE project_id = %s",
+                         incident["project_id"])["id"]
     last_step = db.one("SELECT coalesce(max(id), 0) AS id FROM incident_steps WHERE incident_id = %s",
                        incident["id"])["id"]
     messages = [{"role": "user", "content": prompt.kickoff(incident)}]
@@ -69,7 +70,8 @@ def set_status(incident_id: int, status: str) -> None:
 def environment_updates(run: dict) -> list[str]:
     notes = []
     for d in db.query("SELECT id, service, sha, author, message, actor FROM deploys WHERE id > %s"
-                      " ORDER BY id", run["last_deploy_id"]):
+                      " AND project_id = (SELECT project_id FROM incidents WHERE id = %s) ORDER BY id",
+                      run["last_deploy_id"], run["incident_id"]):
         run["last_deploy_id"] = d["id"]
         if d["actor"] == "tracewise":
             continue
@@ -214,8 +216,8 @@ def finish_resolved(incident: dict, a: dict) -> None:
              " root_cause = %s, fix = %s, lease_owner = NULL WHERE id = %s",
              a["title"], a["summary"], a["root_cause"], a["fix"], incident["id"])
     symptoms = f"{incident['title']}. {a['summary']}"
-    db.query("INSERT INTO memories (incident_id, services, symptoms, root_cause, fix, outcome)"
-             " VALUES (%s, %s, %s, %s, %s, %s)", incident["id"], incident["services"], symptoms,
+    db.query("INSERT INTO memories (project_id, incident_id, services, symptoms, root_cause, fix, outcome)"
+             " VALUES (%s, %s, %s, %s, %s, %s, %s)", incident["project_id"], incident["id"], incident["services"], symptoms,
              a["root_cause"], a["fix"], f"Resolved and verified. Lesson: {a['lesson']}")
     db.add_step(incident["id"], "resolve", a["title"], a, phase="finish")
     db.query("UPDATE agent_runs SET finished_at = now() WHERE incident_id = %s", incident["id"])
@@ -238,7 +240,8 @@ def notify_incident(incident_id: int, outcome: str, reason: str = "", handover: 
                      " WHERE i.id = %s", incident_id)
         wanted = ("all",) if outcome == "resolved" else ("all", "escalations")
         people = db.query("SELECT DISTINCT u.email FROM users u JOIN workspace_members m ON m.user_id = u.id"
-                          " WHERE u.notify_incidents = ANY(%s)", list(wanted))
+                          " WHERE u.notify_incidents = ANY(%s) AND m.workspace_id ="
+                          " (SELECT workspace_id FROM projects WHERE id = %s)", list(wanted), inc["project_id"])
         for p in people:
             if outcome == "resolved":
                 took = (inc["resolved_at"] - inc["opened_at"]).total_seconds()
@@ -254,6 +257,8 @@ def notify_incident(incident_id: int, outcome: str, reason: str = "", handover: 
 
 def run_incident(incident_id: int, worker: str) -> None:
     incident = db.one("SELECT * FROM incidents WHERE id = %s", incident_id)
+    # Every tool call in this run is confined to the incident's project.
+    tools.PROJECT.set(db.one("SELECT * FROM projects WHERE id = %s", incident["project_id"]))
     run = load_run(incident)
     attempt = 1 + db.one("SELECT count(*) AS n FROM incident_steps WHERE incident_id = %s"
                          " AND kind = 'resume'", incident_id)["n"]

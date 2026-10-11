@@ -14,7 +14,9 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from . import db, secrets
+import re
+
+from . import db, secrets, tenancy
 from .sources import syslog
 from .sources.model import register, store
 from .sources.pull import KINDS, SourceError
@@ -69,7 +71,7 @@ def poll(row: dict) -> None:
     started = time.time()
     try:
         records, state = instance(row).poll(dict(row["state"] or {}))
-        counts = store(f"{row['kind']}:{row['name']}", source_id=row["id"], **records)
+        counts = store(f"{row['kind']}:{row['name']}", row["project_id"], source_id=row["id"], **records)
         db.query("UPDATE sources SET state = %s, last_polled_at = now(), poll_lease_until = NULL,"
                  " status_detail = %s WHERE id = %s", db.jsonb(state),
                  f"Last poll {time.time() - started:.1f}s: " + ", ".join(
@@ -83,31 +85,42 @@ def poll(row: dict) -> None:
 
 # ---------- syslog ----------
 
+KEY_RE = re.compile(r"\b(twk_[A-Za-z0-9_-]{20,})\b")
+
+
 class SyslogBuffer:
+    """Syslog has no headers, so each line carries its project key, Papertrail-style: anywhere in the
+    line or in structured data like [tracewise key="twk_..."]. Lines without a valid key are dropped."""
+
     def __init__(self):
         self.lock = threading.Lock()
-        self.items: list[dict] = []
-        self.source_id = None
+        self.items: dict[int, list[dict]] = {}
+        self.dropped = 0
 
     def add(self, line: str):
+        m = KEY_RE.search(line)
+        project = tenancy.project_for_key(m.group(1)) if m else None
+        if not project:
+            self.dropped += 1
+            return
+        line = KEY_RE.sub("", line).replace('[tracewise key=""]', "").replace("  ", " ")
         rec = syslog.parse(line)
         if rec:
             with self.lock:
-                if len(self.items) < 20000:
-                    self.items.append(rec)
+                bucket = self.items.setdefault(project["id"], [])
+                if len(bucket) < 20000:
+                    bucket.append(rec)
 
     def flush_forever(self):
         while True:
             time.sleep(2)
             with self.lock:
-                items, self.items = self.items, []
-            if not items:
-                continue
-            try:
-                self.source_id = self.source_id or register("syslog", "syslog")
-                store("syslog", logs=items, source_id=self.source_id)
-            except Exception:
-                log.exception("syslog flush failed")
+                batches, self.items = self.items, {}
+            for project_id, items in batches.items():
+                try:
+                    store("syslog", project_id, logs=items, source_id=register("syslog", "syslog", project_id))
+                except Exception:
+                    log.exception("syslog flush failed")
 
 
 buffer = SyslogBuffer()

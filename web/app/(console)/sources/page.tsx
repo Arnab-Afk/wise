@@ -198,7 +198,7 @@ function PushSetup({ type, onBack }: { type: PushType; onBack: () => void }) {
           {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
         </button>
       </div>
-      <p className="text-[12px] text-muted-foreground">Replace &lt;ingest key&gt; with your ingest key (TW_INGEST_KEY).</p>
+      <p className="text-[12px] text-muted-foreground">Replace &lt;project ingest key&gt; with a key from <a href="/settings/project" className="underline">Settings → Project</a>. Data sent with it lands in this project only.</p>
       <div><Button variant="ghost" onClick={onBack}>Back</Button></div>
     </div>
   );

@@ -23,7 +23,6 @@ from . import config, db, secrets
 
 log = logging.getLogger("tracewise.runner")
 WORK = Path(os.environ.get("RUNNER_WORK_DIR", "/work"))
-REPO = config.SHOPFRONT_REPO
 JOB_TIMEOUT = int(os.environ.get("TW_FIX_TIMEOUT_SECONDS", "900"))
 WORKER_ID = f"runner-{socket.gethostname()}"
 
@@ -95,7 +94,7 @@ def append_log(job_id: int, line: str) -> None:
     db.notify("incident_events", {"type": "fix_job", "job_id": job_id, "line": line[:300]})
 
 
-def git(*args: str, cwd: str = REPO, check: bool = True) -> str:
+def git(*args: str, cwd: str, check: bool = True) -> str:
     proc = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=60)
     if check and proc.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)}: {proc.stderr.strip()[:500]}")
@@ -195,10 +194,15 @@ def _describe(event: dict) -> list[str]:
 
 def run_job(job: dict) -> None:
     conn = db.one("SELECT * FROM connections WHERE id = %s", job["connection_id"])
+    repo = (db.one("SELECT repo_path FROM projects WHERE id = %s", job["project_id"]) or {}).get("repo_path")
     workdir = WORK / f"fix-{job['id']}"
+    if not repo or not conn:
+        db.query("UPDATE fix_jobs SET status = 'failed', error = %s, finished_at = now() WHERE id = %s",
+                 "The project has no repository" if not repo else "The coding agent was disconnected", job["id"])
+        return
     shutil.rmtree(workdir, ignore_errors=True)
-    git("worktree", "prune")
-    git("worktree", "add", "-B", job["branch"], str(workdir), job["base_sha"])
+    git("worktree", "prune", cwd=repo)
+    git("worktree", "add", "-B", job["branch"], str(workdir), job["base_sha"], cwd=repo)
     append_log(job["id"], f"Worktree ready on {job['branch']} from {job['base_sha'][:10]}")
     try:
         summary, cost = run_agent(job, conn, workdir)
@@ -230,7 +234,7 @@ def run_job(job: dict) -> None:
         db.query("UPDATE fix_jobs SET status = 'failed', error = %s, finished_at = now() WHERE id = %s",
                  str(exc)[:2000], job["id"])
     finally:
-        git("worktree", "remove", "--force", str(workdir), check=False)
+        git("worktree", "remove", "--force", str(workdir), cwd=repo, check=False)
         shutil.rmtree(WORK / f"home-{job['id']}", ignore_errors=True)
         db.notify("incident_events", {"type": "fix_job_done", "job_id": job["id"]})
 

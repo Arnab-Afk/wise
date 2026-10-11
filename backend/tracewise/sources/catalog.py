@@ -114,8 +114,10 @@ default_api_key = "{key}"
     {"kind": "syslog", "label": "Syslog (rsyslog, syslog-ng, network devices, Render, Papertrail-style)",
      "category": "logs", "endpoint": "udp/tcp :{syslog_port}",
      "setup": """# Tracewise listens for RFC 5424 / RFC 3164 syslog on port {syslog_port} (TCP and UDP).
+# Put your project key in every line so Tracewise knows which project it belongs to.
 # rsyslog: /etc/rsyslog.d/90-tracewise.conf
-*.* @@{host}:{syslog_port}
+template(name="tracewise" type="string" string="<%PRI%>1 %TIMESTAMP:::date-rfc3339% %HOSTNAME% %APP-NAME% %PROCID% - [tracewise key=\\"{key}\\"] %msg%\\n")
+*.* @@{host}:{syslog_port};tracewise
 # syslog-ng
 destination d_tracewise {{ network("{host}" port({syslog_port}) transport("tcp")); }};
 # Or run `tracewise watch syslog --listen udp://0.0.0.0:5514` on a host in your network."""},

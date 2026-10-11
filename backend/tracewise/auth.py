@@ -16,7 +16,7 @@ from urllib.parse import urlencode
 import httpx
 from fastapi import APIRouter, HTTPException, Request
 
-from . import config, db, emails
+from . import config, db, emails, tenancy
 
 router = APIRouter(prefix="/v1/auth")
 
@@ -81,14 +81,33 @@ def resolve(request: Request) -> dict | None:
         return None
     if (datetime.now(timezone.utc) - row["last_seen_at"]).total_seconds() > 60:
         db.query("UPDATE sessions SET last_seen_at = now() WHERE id = %s", row["session_id"])
-    wanted = request.headers.get("x-tracewise-workspace")
+    # Headers from the web app; query parameters for EventSource, which can't send headers.
+    wanted = request.headers.get("x-tracewise-workspace") or request.query_params.get("workspace")
     membership = db.one(
         "SELECT w.id, w.name, w.slug, m.role FROM workspace_members m JOIN workspaces w ON w.id = m.workspace_id"
         " WHERE m.user_id = %s AND (%s::bigint IS NULL OR w.id = %s::bigint) ORDER BY m.created_at LIMIT 1",
         row["id"], wanted if (wanted or "").isdigit() else None, wanted if (wanted or "").isdigit() else None)
+    project = None
+    if membership:
+        wanted_project = request.headers.get("x-tracewise-project") or request.query_params.get("project")
+        wanted_project = wanted_project if (wanted_project or "").isdigit() else None
+        project = db.one("SELECT * FROM projects WHERE workspace_id = %s AND (%s::bigint IS NULL OR id = %s::bigint)"
+                         " ORDER BY created_at LIMIT 1", membership["id"], wanted_project, wanted_project) \
+            or db.one("SELECT * FROM projects WHERE workspace_id = %s ORDER BY created_at LIMIT 1", membership["id"])
     return {"user": {k: row[k] for k in ("id", "email", "name", "avatar_url", "notify_incidents")},
             "session_id": row["session_id"], "workspace": membership,
-            "role": membership["role"] if membership else None}
+            "role": membership["role"] if membership else None, "project": project}
+
+
+def service_context(request: Request) -> dict | None:
+    """Scripts, collectors and host agents act inside one project, with its ingest key."""
+    key = request.headers.get("x-ingest-key")
+    p = tenancy.project_for_key(key) if key else None
+    if not p:
+        return None
+    return {"user": None, "session_id": None, "service": True, "role": "member", "project": p,
+            "workspace": {"id": p["workspace_id"], "name": p["workspace_name"], "slug": p["workspace_slug"],
+                          "role": "member"}}
 
 
 def require(request: Request, role: str | None = None) -> dict:
@@ -129,7 +148,14 @@ def upsert_user(email: str, name: str | None = None, avatar: str | None = None) 
     return user, True
 
 
+BOOTSTRAP_OWNERS = {e.strip().lower() for e in os.environ.get("TW_BOOTSTRAP_OWNERS", "").split(",") if e.strip()}
+
+
 def signed_in(user: dict, is_new: bool, method: str, request: Request) -> dict:
+    if user["email"] in BOOTSTRAP_OWNERS:  # operators of this install own the demo workspace
+        db.query("INSERT INTO workspace_members (workspace_id, user_id, role)"
+                 " SELECT id, %s, 'owner' FROM workspaces WHERE slug = %s ON CONFLICT DO NOTHING",
+                 user["id"], tenancy.DEMO_SLUG)
     token = start_session(user, method, request)
     has_workspace = bool(db.one("SELECT 1 FROM workspace_members WHERE user_id = %s", user["id"]))
     return {"token": token, "expires_days": SESSION_DAYS, "new_user": is_new, "has_workspace": has_workspace,
@@ -247,8 +273,12 @@ def me(request: Request):
         "SELECT w.id, w.name, w.slug, m.role FROM workspace_members m JOIN workspaces w ON w.id = m.workspace_id"
         " WHERE m.user_id = %s ORDER BY m.created_at", ctx["user"]["id"])
     identities = [r["provider"] for r in db.query("SELECT provider FROM auth_identities WHERE user_id = %s", ctx["user"]["id"])]
+    projects = db.query("SELECT id, name, slug, description, deployer_url IS NOT NULL AS can_deploy,"
+                        " repo_path IS NOT NULL AS has_repo FROM projects WHERE workspace_id = %s ORDER BY created_at",
+                        ctx["workspace"]["id"]) if ctx["workspace"] else []
     return {**ctx["user"], "workspace": ctx["workspace"], "role": ctx["role"], "workspaces": workspaces,
-            "linked": identities}
+            "linked": identities, "project": ctx["project"] and {k: ctx["project"][k] for k in ("id", "name", "slug")},
+            "projects": projects}
 
 
 @router.patch("/me")

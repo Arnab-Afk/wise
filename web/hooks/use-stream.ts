@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef } from "react";
-import { API } from "@/lib/api";
+import { API, scopeQuery } from "@/lib/api";
 
 export type StreamEvent = { type: string; [key: string]: any }; // eslint-disable-line @typescript-eslint/no-explicit-any
 
@@ -12,7 +12,7 @@ export function useStream(onEvent: (event: StreamEvent) => void) {
     handler.current = onEvent;
   });
   useEffect(() => {
-    const source = new EventSource(`${API}/v1/stream`);
+    const source = new EventSource(`${API}/v1/stream?${scopeQuery()}`);
     const types = ["step", "incident_opened", "deploy", "fix_job", "fix_job_done", "source_event"];
     const listener = (e: MessageEvent) => {
       try {
