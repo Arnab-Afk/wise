@@ -31,8 +31,8 @@ Gross margin is about 90%.
 | | Main | Downside |
 |---|---|---|
 | New customer growth / churn / price | 12% / 3% / $30 | 6% / 5% / $25 |
-| Cash low point | $12.5K (Mar 2027) | $226 (Jan 2028) |
-| Cash-flow positive from | May 2027 | Feb 2028 |
+| Cash low point | $12.5K (Mar 2027) | $226 (Nov 2027) |
+| Cash-flow positive from | Apr 2027 (dips $8 in Jun when the first engineer joins) | Dec 2027 |
 | Customers, Dec 2027 | 97 | 53 |
 | ARR, Dec 2027 | $418K | $190K |
 | Customers, Dec 2028 | 418 | 125 |
