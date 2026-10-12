@@ -123,7 +123,7 @@ switch. Start it with `integrations/lab/up.sh`.
 |---|---|
 | **neatlogs** | One trace per incident run (`tracing.py`): every Claude call (auto-instrumented), every tool call as a span, retries and errors. Used to find and compare failing runs while improving the agent. |
 | **Entire** | Fix commits written by connected agents carry an `Entire-Checkpoint`; the incident agent reads it with `entire checkpoint explain`. The agent's code tools call `entire graph`: `commit` (which functions and config keys a deploy changed), `search`, `impact` (blast radius of a symbol), `explain` (stack trace → file:line), and checkpoint lookup on commits with an `Entire-Checkpoint` trailer. |
-| **cfo.ai** | Business plan for Tracewise: pricing, cost per incident (from neatlogs), revenue and runway. See `docs/business/`. |
+| **cfo.ai** | Business plan built in cfo.ai over its MCP server: pricing, cost per incident (measured, traced in neatlogs), revenue and runway, with a downside scenario. Summary in `docs/business/README.md`; live model at https://app.cfo.ai/s/cPgf01AUStZFzZd3. |
 
 ## Run it
 
