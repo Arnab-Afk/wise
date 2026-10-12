@@ -27,8 +27,10 @@ export function forwardHeaders(request: Request, token?: string | null) {
   if (ua) h["user-agent"] = ua;
   if (ip) h["x-forwarded-for"] = ip;
   if (token) h.authorization = `Bearer ${token}`;
-  const ws = request.headers.get("x-tracewise-workspace");
-  if (ws) h["x-tracewise-workspace"] = ws;
+  for (const name of ["x-tracewise-workspace", "x-tracewise-project"]) {
+    const v = request.headers.get(name);
+    if (v) h[name] = v;
+  }
   return h;
 }
 

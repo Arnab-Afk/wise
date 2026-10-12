@@ -5,7 +5,7 @@ import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useState } from "react";
 import {
-  Activity, Bot, Cable, Check, ChevronDown, ChevronsUpDown, GitCommitHorizontal, LayoutGrid, LogOut, Monitor, Moon, Plus,
+  Activity, Bot, Cable, Check, ChevronsUpDown, GitCommitHorizontal, LayoutGrid, LogOut, Monitor, Moon, Plus,
   Settings, Siren, Sun, UserRound, Users, UsersRound, Wrench,
 } from "lucide-react";
 import { useTheme } from "next-themes";
@@ -74,34 +74,74 @@ export function NavFallback() {
   return <nav className="flex flex-col gap-1 px-1 pt-1">{[...TOP, ...PROJECT, ...PEOPLE, ...WORKSPACE].map((i) => <div key={i.href} className="h-8" />)}</nav>;
 }
 
+interface ProjectHealth { id: number; services: number; open_incidents: number; resolved_30d: number }
+
+function health(h?: ProjectHealth): { tone: "bad" | "ok" | "idle"; label: string } {
+  if (!h) return { tone: "idle", label: "" };
+  if (h.open_incidents) return { tone: "bad", label: `${h.open_incidents} open ${h.open_incidents === 1 ? "incident" : "incidents"}` };
+  if (!h.services) return { tone: "idle", label: "No data yet" };
+  return { tone: "ok", label: `${h.services} ${h.services === 1 ? "service" : "services"} healthy` };
+}
+
+const DOT = { bad: "bg-bad animate-pulse", ok: "bg-ok", idle: "bg-muted-foreground/40" };
+
 function ProjectPicker() {
   const me = useMe();
+  const router = useRouter();
   const [creating, setCreating] = useState(false);
+  const [stats, setStats] = useState<Record<number, ProjectHealth>>({});
+  const wsId = me?.workspace?.id;
+  const load = () => {
+    if (wsId) api<{ projects: ProjectHealth[] }>(`/v1/workspaces/${wsId}/overview`)
+      .then((d) => setStats(Object.fromEntries(d.projects.map((p) => [p.id, p])))).catch(() => {});
+  };
+  // Polls fast until the workspace is known, then every 30 s; incident events refresh it straight away.
+  usePoll(load, wsId ? 30000 : 500);
+  useStream((e) => { if (e.type === "incident_opened" || e.type === "incident_resolved" || e.type === "incident_escalated") load(); });
   if (!me?.project) return null;
+  const current = health(stats[me.project.id]);
   return (
     <div className="mb-1">
-      <DropdownMenu>
-        <DropdownMenuTrigger className="flex h-8 w-full items-center gap-2 rounded-lg border bg-background px-2.5 text-left text-[13px] outline-none hover:border-foreground/20">
-          <span className="size-1.5 rounded-full bg-ok" />
-          <span className="min-w-0 flex-1 truncate font-mono text-[12.5px]">{me.project.slug}</span>
-          <ChevronDown className="size-3.5 text-muted-foreground" />
+      <DropdownMenu onOpenChange={(open) => { if (open) load(); }}>
+        <DropdownMenuTrigger className="flex w-full items-center gap-2.5 rounded-lg border bg-background p-1.5 pr-2 text-left outline-none transition-colors hover:border-foreground/20 data-[popup-open]:border-foreground/25">
+          <Avatar name={me.project.name} size={28} square />
+          <span className="min-w-0 flex-1">
+            <span className="block truncate text-[13px] leading-tight font-medium">{me.project.name}</span>
+            <span className="flex items-center gap-1.5 text-[11.5px] leading-tight text-muted-foreground">
+              <span className={cn("size-1.5 shrink-0 rounded-full", DOT[current.tone])} />
+              <span className="truncate">{current.label || me.project.slug}</span>
+            </span>
+          </span>
+          <ChevronsUpDown className="size-3.5 shrink-0 text-muted-foreground" />
         </DropdownMenuTrigger>
-        <DropdownMenuContent className="w-56 p-1.5">
+        <DropdownMenuContent className="w-72 p-1.5" align="start">
           <DropdownMenuGroup>
             <DropdownMenuLabel>Projects in {me.workspace?.name}</DropdownMenuLabel>
-            {me.projects.map((p) => (
-              <DropdownMenuItem key={p.id} onClick={() => switchTo(me.workspace?.id ?? null, p.id)} className="py-1.5">
-                <span className="min-w-0 flex-1 truncate font-mono text-[12.5px]">{p.slug}</span>
-                {p.id === me.project?.id && <Check className="size-3.5" />}
-              </DropdownMenuItem>
-            ))}
+            <div className="max-h-[320px] overflow-y-auto">
+              {me.projects.map((p) => {
+                const h = health(stats[p.id]);
+                const selected = p.id === me.project?.id;
+                return (
+                  <DropdownMenuItem key={p.id} onClick={() => { if (!selected) switchTo(me.workspace?.id ?? null, p.id); }}
+                    className={cn("gap-2.5 py-2", selected && "bg-foreground/[0.04]")}>
+                    <Avatar name={p.name} size={28} square />
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate text-[13.5px]">{p.name}</span>
+                      <span className="flex items-center gap-1.5 text-[12px] text-muted-foreground">
+                        <span className={cn("size-1.5 shrink-0 rounded-full", DOT[h.tone])} />
+                        <span className="truncate">{h.label || p.slug}</span>
+                      </span>
+                    </span>
+                    {selected && <Check className="size-3.5" />}
+                  </DropdownMenuItem>
+                );
+              })}
+            </div>
           </DropdownMenuGroup>
-          {canAdmin(me) && (
-            <>
-              <DropdownMenuSeparator />
-              <DropdownMenuItem onClick={() => setCreating(true)} className="py-1.5 text-muted-foreground"><Plus />New project</DropdownMenuItem>
-            </>
-          )}
+          <DropdownMenuSeparator />
+          <DropdownMenuItem onClick={() => router.push("/settings/project")} className="py-1.5"><Settings />Project settings</DropdownMenuItem>
+          <DropdownMenuItem onClick={() => router.push("/overview")} className="py-1.5"><LayoutGrid />All projects</DropdownMenuItem>
+          {canAdmin(me) && <DropdownMenuItem onClick={() => setCreating(true)} className="py-1.5"><Plus />New project</DropdownMenuItem>}
         </DropdownMenuContent>
       </DropdownMenu>
       <NewProjectDialog open={creating} onOpenChange={setCreating} />
